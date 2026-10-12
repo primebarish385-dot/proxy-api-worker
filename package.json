@@ -1,0 +1,14 @@
+{
+  "name": "proxy-api-worker",
+  "version": "1.0.0",
+  "description": "Combined proxy API worker for Anikoto and ToonStream streaming links",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}

@@ -1,14 +1,16 @@
-// src/index.js - Proxy API Worker (Sub + Dub Version)
+// src/index.js - Proxy API Worker (Final Version)
 // Anikoto: Sub + Dub | ToonStream: Hindi Dub
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
 
+// ToonStream: শুধু যেসব সার্ভার সরাসরি iframe-এ কাজ করে
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
   "vidara.to",
   "vidc.upns.pro",
   "abyssplayer.com",
+  "filesforever.link",
 ];
 
 const CORS_HEADERS = {
@@ -65,7 +67,6 @@ async function fetchJSON(url) {
 async function getAnikotoLinks(title, episode) {
   const servers = [];
 
-  // Sub এবং Dub দুটোই আনব
   for (const type of ["sub", "dub"]) {
     try {
       const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
@@ -80,7 +81,6 @@ async function getAnikotoLinks(title, episode) {
       if (!episodeData?.success || !episodeData.data?.servers) continue;
 
       for (const server of episodeData.data.servers) {
-        // শুধু নির্দিষ্ট type (sub/dub) নাও
         if (server.type !== type) continue;
 
         let embedUrl = server.embedUrl || server.embed_url;
@@ -109,6 +109,15 @@ async function getAnikotoLinks(title, episode) {
 }
 
 // ============ TOONSTREAM (Hindi Dub Only) ============
+function getToonStreamServerName(url) {
+  if (url.includes("voe.sx")) return "VOE";
+  if (url.includes("vidara.to")) return "Vidara";
+  if (url.includes("vidc.upns.pro")) return "Vidc";
+  if (url.includes("abyssplayer.com")) return "Abyss";
+  if (url.includes("filesforever.link")) return "FilesForever";
+  return "Unknown";
+}
+
 async function getToonStreamLinks(slug, season, episode) {
   const servers = [];
   try {
@@ -126,16 +135,10 @@ async function getToonStreamLinks(slug, season, episode) {
       );
       if (!isWorking) continue;
 
-      let serverName = "Unknown";
-      if (originalUrl.includes("voe.sx")) serverName = "VOE";
-      else if (originalUrl.includes("vidara.to")) serverName = "Vidara";
-      else if (originalUrl.includes("vidc.upns.pro")) serverName = "Vidc";
-      else if (originalUrl.includes("abyssplayer.com")) serverName = "Abyss";
-
       servers.push({
-        server_name: `ToonStream - ${serverName}`,
+        server_name: `ToonStream - ${getToonStreamServerName(originalUrl)}`,
         source: "toonstream",
-        type: "dub", // হিন্দি ডাব
+        type: "dub",
         language: "hindi",
         embed_url: originalUrl,
         ready_to_use: true,
@@ -203,14 +206,10 @@ async function handleStreamingAPI(url) {
     slug ? getToonStreamLinks(slug, season, episode) : Promise.resolve([]),
   ]);
 
-  // Sub ও Dub আলাদা করা
-  const subServers = [
-    ...anikotoServers.filter((s) => s.type === "sub"),
-    ...toonstreamServers.filter((s) => s.type === "sub"),
-  ];
+  const subServers = anikotoServers.filter((s) => s.type === "sub");
   const dubServers = [
     ...anikotoServers.filter((s) => s.type === "dub"),
-    ...toonstreamServers.filter((s) => s.type === "dub"),
+    ...toonstreamServers,
   ];
 
   const allServers = [...anikotoServers, ...toonstreamServers];

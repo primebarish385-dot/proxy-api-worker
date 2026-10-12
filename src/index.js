@@ -1,5 +1,5 @@
 // src/index.js - Proxy API Worker (Final Version)
-// Anikoto: Sub + Dub | ToonStream: Hindi Dub
+// Anikoto: Sub + Dub | ToonStream: Hindi Dub with Auto-Numbering
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
@@ -108,7 +108,7 @@ async function getAnikotoLinks(title, episode) {
   return servers;
 }
 
-// ============ TOONSTREAM (Hindi Dub Only) ============
+// ============ TOONSTREAM (Hindi Dub with Auto-Numbering) ============
 function getToonStreamServerName(url) {
   if (url.includes("voe.sx")) return "VOE";
   if (url.includes("vidara.to")) return "Vidara";
@@ -126,6 +126,8 @@ async function getToonStreamLinks(slug, season, episode) {
 
     if (!data?.success || !data.data?.servers) return servers;
 
+    // ধাপ ১: শুধু working সার্ভার ফিল্টার করে URL সংগ্রহ করা
+    const workingUrls = [];
     for (const server of data.data.servers) {
       const originalUrl = server.embed_url;
       if (!originalUrl) continue;
@@ -135,8 +137,30 @@ async function getToonStreamLinks(slug, season, episode) {
       );
       if (!isWorking) continue;
 
+      workingUrls.push(originalUrl);
+    }
+
+    // ধাপ ২: প্রতিটি ডোমেইনের সংখ্যা গণনা করা
+    const domainCounts = {};
+    for (const url of workingUrls) {
+      const baseName = getToonStreamServerName(url);
+      domainCounts[baseName] = (domainCounts[baseName] || 0) + 1;
+    }
+
+    // ধাপ ৩: একই ডোমেইনের একাধিক থাকলে নাম্বার যোগ করা
+    const domainIndexes = {};
+    for (const originalUrl of workingUrls) {
+      const baseName = getToonStreamServerName(originalUrl);
+      let finalName = baseName;
+
+      // শুধু তখনই নাম্বার যোগ হবে যখন একই ডোমেইনে একাধিক লিংক থাকবে
+      if (domainCounts[baseName] > 1) {
+        domainIndexes[baseName] = (domainIndexes[baseName] || 0) + 1;
+        finalName = `${baseName} ${domainIndexes[baseName]}`;
+      }
+
       servers.push({
-        server_name: `ToonStream - ${getToonStreamServerName(originalUrl)}`,
+        server_name: `ToonStream - ${finalName}`,
         source: "toonstream",
         type: "dub",
         language: "hindi",

@@ -1,11 +1,21 @@
-// src/index.js - Proxy API Worker (Production Ready v2.0)
-// Features: Anikoto (Eng Sub+Dub) | ToonStream (Multi Audio)
-// Auto-Numbering | Search Fallback | Smart Filtering
+// ===================================================================
+// src/index.js - Proxy API Worker (Industrial Level v3.0)
+// ===================================================================
+// Features:
+//   • Anikoto      → Eng Sub + Eng Dub (/videojs/ auto-inject)
+//   • ToonStream   → Multi Audio (Hindi, Tamil, Telugu, etc.)
+//   • Auto-Numbering for duplicate servers (FilesForever 1, 2, 3...)
+//   • Multi-Slug Search Fallback (tries ALL matches, not just first)
+//   • Title Match Scoring (best slug wins)
+//   • Parallel Fetching (Anikoto + ToonStream simultaneously)
+//   • CORS enabled for cross-account Workers
+// ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
+const TOONSTREAM_SITE = "https://toonstream.us";
 
-// ToonStream: শুধু যেসব সার্ভার সরাসরি iframe-এ কাজ করে
+// Servers that work directly inside <iframe> without proxy
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
   "vidara.to",
@@ -23,6 +33,9 @@ const CORS_HEADERS = {
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+// ===================================================================
+// ENTRY POINT
+// ===================================================================
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -38,16 +51,19 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "2.0",
+      version: "3.0-industrial",
       endpoints: {
         streaming: "/api/streaming?slug=...&title=...&season=...&episode=...",
         proxy: "/proxy?url=ENCODED_URL",
       },
+      sources: ["anikoto", "toonstream"],
     });
   },
 };
 
-// ============ UTILITIES ============
+// ===================================================================
+// UTILITIES
+// ===================================================================
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -58,10 +74,7 @@ function jsonResponse(data, status = 200) {
 async function fetchJSON(url, extraHeaders = {}) {
   try {
     const res = await fetch(url, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        ...extraHeaders,
-      },
+      headers: { "User-Agent": USER_AGENT, ...extraHeaders },
     });
     if (!res.ok) return null;
     return await res.json();
@@ -70,7 +83,9 @@ async function fetchJSON(url, extraHeaders = {}) {
   }
 }
 
-// ============ ANIKOTO (Eng Sub + Eng Dub) ============
+// ===================================================================
+// ANIKOTO - Eng Sub + Eng Dub
+// ===================================================================
 async function getAnikotoLinks(title, episode) {
   const servers = [];
 
@@ -93,7 +108,7 @@ async function getAnikotoLinks(title, episode) {
         let embedUrl = server.embedUrl || server.embed_url;
         if (!embedUrl) continue;
 
-        // /videojs/ ট্যাগ অ্যাপ্লাই
+        // Inject /videojs/ for megaplay.buzz
         if (embedUrl.includes("megaplay.buzz/stream/")) {
           embedUrl = embedUrl.replace(
             "megaplay.buzz/stream/",
@@ -110,13 +125,17 @@ async function getAnikotoLinks(title, episode) {
           ready_to_use: true,
         });
       }
-    } catch (e) {}
+    } catch (e) {
+      // Silent fail — try next type
+    }
   }
 
   return servers;
 }
 
-// ============ TOONSTREAM HELPERS ============
+// ===================================================================
+// TOONSTREAM HELPERS
+// ===================================================================
 function getToonStreamServerName(url) {
   if (url.includes("voe.sx")) return "VOE";
   if (url.includes("vidara.to")) return "Vidara";
@@ -126,7 +145,7 @@ function getToonStreamServerName(url) {
   return "Unknown";
 }
 
-// ToonStream Scraper থেকে সার্ভার আনা
+// Fetch raw servers from ToonStream Scraper API
 async function fetchToonStreamServers(slug, season, episode) {
   try {
     const apiUrl = `${TOONSTREAM_API}/api/streaming?slug=${encodeURIComponent(slug)}&season=${season}&episode=${episode}`;
@@ -138,52 +157,63 @@ async function fetchToonStreamServers(slug, season, episode) {
   return [];
 }
 
-// ToonStream সার্চ API দিয়ে সঠিক স্লাগ খোঁজা
-async function searchToonStreamSlug(title) {
+// Search ToonStream → returns array of slugs sorted by title match score
+async function searchToonStreamSlugs(title) {
   try {
-    const searchUrl = `https://toonstream.us/search/all?q=${encodeURIComponent(title)}`;
+    const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
     const res = await fetch(searchUrl, {
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "application/json, text/plain, */*",
-        Referer: "https://toonstream.us/",
+        Referer: `${TOONSTREAM_SITE}/`,
       },
     });
-    if (!res.ok) return null;
+    if (!res.ok) return [];
 
     const json = await res.json();
-    if (!Array.isArray(json.data) || json.data.length === 0) return null;
+    if (!Array.isArray(json.data) || json.data.length === 0) return [];
 
-    // প্রথম রেজাল্ট থেকে স্লাগ এক্সট্রাক্ট
+    const titleLower = title.toLowerCase().trim();
+    const scored = [];
+
     for (const item of json.data) {
       const itemUrl = item.url || "";
+      const itemTitle = (item.title || "").toLowerCase().trim();
       const match = itemUrl.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
-      if (match && match[1]) {
-        return match[1];
+      if (!match || !match[1]) continue;
+
+      // Title match scoring
+      let score = 30;
+      if (itemTitle === titleLower) score = 100;
+      else if (itemTitle.startsWith(titleLower)) score = 90;
+      else if (itemTitle.includes(titleLower)) score = 80;
+      else if (titleLower.includes(itemTitle)) score = 70;
+
+      // Bonus for matching type (series vs movie)
+      if (item.type === "series") score += 5;
+
+      scored.push({ slug: match[1], title: itemTitle, score });
+    }
+
+    // Sort by score DESC, then deduplicate
+    scored.sort((a, b) => b.score - a.score);
+    const seen = new Set();
+    const unique = [];
+    for (const item of scored) {
+      if (!seen.has(item.slug)) {
+        seen.add(item.slug);
+        unique.push(item.slug);
       }
     }
-  } catch (e) {}
-  return null;
+    return unique;
+  } catch (e) {
+    return [];
+  }
 }
 
-// ============ TOONSTREAM (Multi Audio + Search Fallback) ============
-async function getToonStreamLinks(slug, season, episode, title) {
-  const servers = [];
-
-  // ধাপ ১: সরাসরি স্লাগ দিয়ে চেষ্টা
-  let rawServers = await fetchToonStreamServers(slug, season, episode);
-
-  // ধাপ ২: ব্যর্থ হলে Search API দিয়ে সঠিক স্লাগ খোঁজা
-  if (rawServers.length === 0 && title) {
-    const newSlug = await searchToonStreamSlug(title);
-    if (newSlug && newSlug !== slug) {
-      rawServers = await fetchToonStreamServers(newSlug, season, episode);
-    }
-  }
-
-  if (rawServers.length === 0) return servers;
-
-  // ধাপ ৩: শুধু working সার্ভার ফিল্টার
+// Filter + auto-numbering for ToonStream servers
+function buildToonStreamServers(rawServers) {
+  // Step 1: Filter only working servers
   const workingUrls = [];
   for (const server of rawServers) {
     const originalUrl = server.embed_url;
@@ -193,19 +223,21 @@ async function getToonStreamLinks(slug, season, episode, title) {
       originalUrl.includes(domain)
     );
     if (!isWorking) continue;
-
     workingUrls.push(originalUrl);
   }
 
-  // ধাপ ৪: প্রতিটি ডোমেইনের সংখ্যা গণনা
+  if (workingUrls.length === 0) return [];
+
+  // Step 2: Count domains
   const domainCounts = {};
   for (const url of workingUrls) {
     const baseName = getToonStreamServerName(url);
     domainCounts[baseName] = (domainCounts[baseName] || 0) + 1;
   }
 
-  // ধাপ ৫: একই ডোমেইনের একাধিক থাকলে নাম্বার যোগ
+  // Step 3: Add numbering when duplicates exist
   const domainIndexes = {};
+  const servers = [];
   for (const originalUrl of workingUrls) {
     const baseName = getToonStreamServerName(originalUrl);
     let finalName = baseName;
@@ -228,7 +260,32 @@ async function getToonStreamLinks(slug, season, episode, title) {
   return servers;
 }
 
-// ============ PROXY HANDLER ============
+// ===================================================================
+// TOONSTREAM - Multi Audio with Multi-Slug Fallback
+// ===================================================================
+async function getToonStreamLinks(slug, season, episode, title) {
+  // Step 1: Try direct slug
+  let rawServers = await fetchToonStreamServers(slug, season, episode);
+  let servers = buildToonStreamServers(rawServers);
+  if (servers.length > 0) return servers;
+
+  // Step 2: Search fallback — try ALL matching slugs until one works
+  if (title) {
+    const candidateSlugs = await searchToonStreamSlugs(title);
+    for (const candidate of candidateSlugs) {
+      if (candidate === slug) continue; // already tried
+      rawServers = await fetchToonStreamServers(candidate, season, episode);
+      servers = buildToonStreamServers(rawServers);
+      if (servers.length > 0) return servers;
+    }
+  }
+
+  return [];
+}
+
+// ===================================================================
+// PROXY HANDLER
+// ===================================================================
 async function handleProxy(url) {
   const targetUrl = url.searchParams.get("url");
   if (!targetUrl) {
@@ -239,7 +296,10 @@ async function handleProxy(url) {
     const targetURL = new URL(targetUrl);
     const headers = new Headers();
     headers.set("User-Agent", USER_AGENT);
-    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    headers.set(
+      "Accept",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    );
     headers.set("Accept-Language", "en-US,en;q=0.9");
     headers.set("Referer", targetURL.origin + "/");
 
@@ -248,6 +308,7 @@ async function handleProxy(url) {
     const newHeaders = new Headers(response.headers);
     newHeaders.delete("X-Frame-Options");
     newHeaders.delete("Content-Security-Policy");
+    newHeaders.delete("Content-Security-Policy-Report-Only");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
     return new Response(response.body, {
@@ -259,7 +320,9 @@ async function handleProxy(url) {
   }
 }
 
-// ============ MAIN STREAMING API ============
+// ===================================================================
+// MAIN STREAMING API HANDLER
+// ===================================================================
 async function handleStreamingAPI(url) {
   const params = url.searchParams;
   const anilistId = params.get("anilist_id");
@@ -278,7 +341,7 @@ async function handleStreamingAPI(url) {
 
   const searchTitle = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
 
-  // Parallel execution: Anikoto + ToonStream একসাথে
+  // Parallel fetch: Anikoto + ToonStream simultaneously
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(searchTitle, episode),
     slug

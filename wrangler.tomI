@@ -1,0 +1,7 @@
+name = "proxy-api-worker"
+main = "src/index.js"
+compatibility_date = "2026-10-12"
+
+# Environment variables (Cloudflare Dashboard এ সেট করবেন)
+# ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com"
+# TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com"

@@ -1,10 +1,9 @@
-// src/index.js - Proxy API Worker (Final Version)
-// Combines Anikoto API and ToonStream Scraper with smart filtering
+// src/index.js - Proxy API Worker (Sub + Dub Version)
+// Anikoto: Sub + Dub | ToonStream: Hindi Dub
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
 
-// ToonStream: শুধু যেসব সার্ভার সরাসরি iframe-এ কাজ করে
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
   "vidara.to",
@@ -37,7 +36,6 @@ export default {
         streaming: "/api/streaming?slug=...&title=...&season=...&episode=...",
         proxy: "/proxy?url=ENCODED_URL",
       },
-      working_toonstream_servers: WORKING_TOONSTREAM_SERVERS,
     });
   },
 };
@@ -63,46 +61,54 @@ async function fetchJSON(url) {
   }
 }
 
-// ============ ANIKOTO ============
+// ============ ANIKOTO (Sub + Dub) ============
 async function getAnikotoLinks(title, episode) {
   const servers = [];
-  try {
-    const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
-    const searchData = await fetchJSON(searchUrl);
 
-    if (!searchData?.success || !searchData.data?.results?.length) return servers;
+  // Sub এবং Dub দুটোই আনব
+  for (const type of ["sub", "dub"]) {
+    try {
+      const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
+      const searchData = await fetchJSON(searchUrl);
 
-    const targetSlug = searchData.data.results[0].slug;
-    const episodeUrl = `${ANIKOTO_API}/api/episode/${targetSlug}/${episode}`;
-    const episodeData = await fetchJSON(episodeUrl);
+      if (!searchData?.success || !searchData.data?.results?.length) continue;
 
-    if (!episodeData?.success || !episodeData.data?.servers) return servers;
+      const targetSlug = searchData.data.results[0].slug;
+      const episodeUrl = `${ANIKOTO_API}/api/episode/${targetSlug}/${episode}`;
+      const episodeData = await fetchJSON(episodeUrl);
 
-    for (const server of episodeData.data.servers) {
-      let embedUrl = server.embedUrl || server.embed_url;
-      if (!embedUrl) continue;
+      if (!episodeData?.success || !episodeData.data?.servers) continue;
 
-      // /videojs/ ট্যাগ অ্যাপ্লাই করা
-      if (embedUrl.includes("megaplay.buzz/stream/")) {
-        embedUrl = embedUrl.replace(
-          "megaplay.buzz/stream/",
-          "megaplay.buzz/videojs/stream/"
-        );
+      for (const server of episodeData.data.servers) {
+        // শুধু নির্দিষ্ট type (sub/dub) নাও
+        if (server.type !== type) continue;
+
+        let embedUrl = server.embedUrl || server.embed_url;
+        if (!embedUrl) continue;
+
+        // /videojs/ ট্যাগ অ্যাপ্লাই
+        if (embedUrl.includes("megaplay.buzz/stream/")) {
+          embedUrl = embedUrl.replace(
+            "megaplay.buzz/stream/",
+            "megaplay.buzz/videojs/stream/"
+          );
+        }
+
+        servers.push({
+          server_name: `Anikoto - ${server.name || "Server"}`,
+          source: "anikoto",
+          type: type,
+          embed_url: embedUrl,
+          ready_to_use: true,
+        });
       }
+    } catch (e) {}
+  }
 
-      servers.push({
-        server_name: `Anikoto - ${server.name || "Server"}`,
-        source: "anikoto",
-        type: server.type || "sub",
-        embed_url: embedUrl,
-        ready_to_use: true,
-      });
-    }
-  } catch (e) {}
   return servers;
 }
 
-// ============ TOONSTREAM ============
+// ============ TOONSTREAM (Hindi Dub Only) ============
 async function getToonStreamLinks(slug, season, episode) {
   const servers = [];
   try {
@@ -115,13 +121,11 @@ async function getToonStreamLinks(slug, season, episode) {
       const originalUrl = server.embed_url;
       if (!originalUrl) continue;
 
-      // শুধু কাজ করা সার্ভারগুলো ফিল্টার করা
       const isWorking = WORKING_TOONSTREAM_SERVERS.some((domain) =>
         originalUrl.includes(domain)
       );
       if (!isWorking) continue;
 
-      // সার্ভারের নাম বের করা
       let serverName = "Unknown";
       if (originalUrl.includes("voe.sx")) serverName = "VOE";
       else if (originalUrl.includes("vidara.to")) serverName = "Vidara";
@@ -131,7 +135,8 @@ async function getToonStreamLinks(slug, season, episode) {
       servers.push({
         server_name: `ToonStream - ${serverName}`,
         source: "toonstream",
-        type: "sub",
+        type: "dub", // হিন্দি ডাব
+        language: "hindi",
         embed_url: originalUrl,
         ready_to_use: true,
       });
@@ -140,7 +145,7 @@ async function getToonStreamLinks(slug, season, episode) {
   return servers;
 }
 
-// ============ PROXY HANDLER (Fallback) ============
+// ============ PROXY HANDLER ============
 async function handleProxy(url) {
   const targetUrl = url.searchParams.get("url");
   if (!targetUrl) {
@@ -149,7 +154,6 @@ async function handleProxy(url) {
 
   try {
     const targetURL = new URL(targetUrl);
-
     const headers = new Headers();
     headers.set(
       "User-Agent",
@@ -196,10 +200,18 @@ async function handleStreamingAPI(url) {
 
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(searchTitle, episode),
-    slug
-      ? getToonStreamLinks(slug, season, episode)
-      : Promise.resolve([]),
+    slug ? getToonStreamLinks(slug, season, episode) : Promise.resolve([]),
   ]);
+
+  // Sub ও Dub আলাদা করা
+  const subServers = [
+    ...anikotoServers.filter((s) => s.type === "sub"),
+    ...toonstreamServers.filter((s) => s.type === "sub"),
+  ];
+  const dubServers = [
+    ...anikotoServers.filter((s) => s.type === "dub"),
+    ...toonstreamServers.filter((s) => s.type === "dub"),
+  ];
 
   const allServers = [...anikotoServers, ...toonstreamServers];
 
@@ -213,8 +225,8 @@ async function handleStreamingAPI(url) {
       season: season,
       episode: episode,
       total_servers: allServers.length,
-      anikoto_count: anikotoServers.length,
-      toonstream_count: toonstreamServers.length,
+      sub_count: subServers.length,
+      dub_count: dubServers.length,
       servers: allServers,
     },
   });

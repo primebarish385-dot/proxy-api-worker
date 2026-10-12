@@ -1,8 +1,16 @@
-// src/index.js - Proxy API Worker
-// Combines Anikoto API and ToonStream Scraper
+// src/index.js - Proxy API Worker (Final Version)
+// Combines Anikoto API and ToonStream Scraper with smart filtering
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
+
+// ToonStream: শুধু যেসব সার্ভার সরাসরি iframe-এ কাজ করে
+const WORKING_TOONSTREAM_SERVERS = [
+  "voe.sx",
+  "vidara.to",
+  "vidc.upns.pro",
+  "abyssplayer.com",
+];
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -26,9 +34,10 @@ export default {
       success: true,
       message: "Proxy API Worker is running",
       endpoints: {
-        streaming: "/api/streaming?anilist_id=...&slug=...&title=...&season=...&episode=...",
+        streaming: "/api/streaming?slug=...&title=...&season=...&episode=...",
         proxy: "/proxy?url=ENCODED_URL",
       },
+      working_toonstream_servers: WORKING_TOONSTREAM_SERVERS,
     });
   },
 };
@@ -86,7 +95,7 @@ async function getAnikotoLinks(title, episode) {
         source: "anikoto",
         type: server.type || "sub",
         embed_url: embedUrl,
-        is_proxied: false,
+        ready_to_use: true,
       });
     }
   } catch (e) {}
@@ -94,7 +103,7 @@ async function getAnikotoLinks(title, episode) {
 }
 
 // ============ TOONSTREAM ============
-async function getToonStreamLinks(slug, season, episode, workerOrigin) {
+async function getToonStreamLinks(slug, season, episode) {
   const servers = [];
   try {
     const apiUrl = `${TOONSTREAM_API}/api/streaming?slug=${encodeURIComponent(slug)}&season=${season}&episode=${episode}`;
@@ -103,22 +112,35 @@ async function getToonStreamLinks(slug, season, episode, workerOrigin) {
     if (!data?.success || !data.data?.servers) return servers;
 
     for (const server of data.data.servers) {
-      const proxiedUrl = `${workerOrigin}/proxy?url=${encodeURIComponent(server.embed_url)}`;
+      const originalUrl = server.embed_url;
+      if (!originalUrl) continue;
+
+      // শুধু কাজ করা সার্ভারগুলো ফিল্টার করা
+      const isWorking = WORKING_TOONSTREAM_SERVERS.some((domain) =>
+        originalUrl.includes(domain)
+      );
+      if (!isWorking) continue;
+
+      // সার্ভারের নাম বের করা
+      let serverName = "Unknown";
+      if (originalUrl.includes("voe.sx")) serverName = "VOE";
+      else if (originalUrl.includes("vidara.to")) serverName = "Vidara";
+      else if (originalUrl.includes("vidc.upns.pro")) serverName = "Vidc";
+      else if (originalUrl.includes("abyssplayer.com")) serverName = "Abyss";
 
       servers.push({
-        server_name: `ToonStream - Server ${server.server_number}`,
+        server_name: `ToonStream - ${serverName}`,
         source: "toonstream",
         type: "sub",
-        embed_url: proxiedUrl,
-        original_url: server.embed_url,
-        is_proxied: true,
+        embed_url: originalUrl,
+        ready_to_use: true,
       });
     }
   } catch (e) {}
   return servers;
 }
 
-// ============ PROXY HANDLER ============
+// ============ PROXY HANDLER (Fallback) ============
 async function handleProxy(url) {
   const targetUrl = url.searchParams.get("url");
   if (!targetUrl) {
@@ -137,15 +159,11 @@ async function handleProxy(url) {
     headers.set("Accept-Language", "en-US,en;q=0.9");
     headers.set("Referer", targetURL.origin + "/");
 
-    const response = await fetch(targetUrl, {
-      headers: headers,
-      redirect: "follow",
-    });
+    const response = await fetch(targetUrl, { headers, redirect: "follow" });
 
     const newHeaders = new Headers(response.headers);
     newHeaders.delete("X-Frame-Options");
     newHeaders.delete("Content-Security-Policy");
-    newHeaders.delete("Content-Security-Policy-Report-Only");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
     return new Response(response.body, {
@@ -174,13 +192,12 @@ async function handleStreamingAPI(url) {
     );
   }
 
-  const workerOrigin = url.origin;
   const searchTitle = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
 
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(searchTitle, episode),
     slug
-      ? getToonStreamLinks(slug, season, episode, workerOrigin)
+      ? getToonStreamLinks(slug, season, episode)
       : Promise.resolve([]),
   ]);
 
@@ -196,7 +213,9 @@ async function handleStreamingAPI(url) {
       season: season,
       episode: episode,
       total_servers: allServers.length,
+      anikoto_count: anikotoServers.length,
+      toonstream_count: toonstreamServers.length,
       servers: allServers,
     },
   });
-      }
+}

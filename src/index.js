@@ -1,5 +1,5 @@
-// src/index.js - Proxy API Worker (Final Version)
-// Anikoto: Sub + Dub | ToonStream: Hindi Dub with Auto-Numbering
+// src/index.js - Proxy API Worker (Final Version with Language Labels)
+// Anikoto: Eng Sub + Eng Dub | ToonStream: Multi Audio
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
@@ -63,7 +63,7 @@ async function fetchJSON(url) {
   }
 }
 
-// ============ ANIKOTO (Sub + Dub) ============
+// ============ ANIKOTO (Eng Sub + Eng Dub) ============
 async function getAnikotoLinks(title, episode) {
   const servers = [];
 
@@ -98,6 +98,7 @@ async function getAnikotoLinks(title, episode) {
           server_name: `Anikoto - ${server.name || "Server"}`,
           source: "anikoto",
           type: type,
+          language: "english",
           embed_url: embedUrl,
           ready_to_use: true,
         });
@@ -108,7 +109,7 @@ async function getAnikotoLinks(title, episode) {
   return servers;
 }
 
-// ============ TOONSTREAM (Hindi Dub with Auto-Numbering) ============
+// ============ TOONSTREAM (Multi Audio with Auto-Numbering) ============
 function getToonStreamServerName(url) {
   if (url.includes("voe.sx")) return "VOE";
   if (url.includes("vidara.to")) return "Vidara";
@@ -163,7 +164,7 @@ async function getToonStreamLinks(slug, season, episode) {
         server_name: `ToonStream - ${finalName}`,
         source: "toonstream",
         type: "dub",
-        language: "hindi",
+        language: "multi-audio",
         embed_url: originalUrl,
         ready_to_use: true,
       });

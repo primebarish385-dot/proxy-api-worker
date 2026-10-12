@@ -1,9 +1,9 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v3.0)
+// src/index.js - Proxy API Worker (Industrial Level v4.0)
 // ===================================================================
 // Features:
 //   • Anikoto      → Eng Sub + Eng Dub (/videojs/ auto-inject)
-//   • ToonStream   → Multi Audio (Hindi, Tamil, Telugu, etc.)
+//   • ToonStream   → Multi Audio (8 working servers)
 //   • Auto-Numbering for duplicate servers (FilesForever 1, 2, 3...)
 //   • Multi-Slug Search Fallback (tries ALL matches, not just first)
 //   • Title Match Scoring (best slug wins)
@@ -15,13 +15,16 @@ const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
 const TOONSTREAM_SITE = "https://toonstream.us";
 
-// Servers that work directly inside <iframe> without proxy
+// ToonStream servers that work directly inside <iframe> without proxy
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
   "vidara.to",
   "vidc.upns.pro",
   "abyssplayer.com",
   "filesforever.link",
+  "ravok.buzz",
+  "cloudy.upns.one",
+  "vidmoly.net",
 ];
 
 const CORS_HEADERS = {
@@ -51,12 +54,13 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "3.0-industrial",
+      version: "4.0-industrial",
       endpoints: {
         streaming: "/api/streaming?slug=...&title=...&season=...&episode=...",
         proxy: "/proxy?url=ENCODED_URL",
       },
       sources: ["anikoto", "toonstream"],
+      working_servers: WORKING_TOONSTREAM_SERVERS.length,
     });
   },
 };
@@ -142,6 +146,9 @@ function getToonStreamServerName(url) {
   if (url.includes("vidc.upns.pro")) return "Vidc";
   if (url.includes("abyssplayer.com")) return "Abyss";
   if (url.includes("filesforever.link")) return "FilesForever";
+  if (url.includes("ravok.buzz")) return "Ravok";
+  if (url.includes("cloudy.upns.one")) return "Cloudy";
+  if (url.includes("vidmoly.net")) return "Vidmoly";
   return "Unknown";
 }
 
@@ -372,4 +379,4 @@ async function handleStreamingAPI(url) {
       servers: allServers,
     },
   });
-}
+      }

@@ -1,9 +1,11 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v6.1)
+// src/index.js - Proxy API Worker (Industrial Level v7.0 - FINAL)
 // ===================================================================
-// v6.1 Fix:
-//   • getSlugCandidates: TITLE-based slugs FIRST, then DB slug
-//     (Because ToonStream uses English titles, not AniList romaji)
+// v7.0 Features:
+//   • Auto-slug discovery (Title-first priority)
+//   • Debug endpoints for troubleshooting
+//   • 6-layer fallback for ToonStream
+//   • BOTH titles used for search
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -67,14 +69,16 @@ export default {
 
     if (path === "/proxy") return handleProxy(url);
     if (path === "/api/streaming" || path === "/api") return handleStreamingAPI(url);
+    if (path === "/api/debug") return handleDebug(url);
+    if (path === "/api/slug-test") return handleSlugTest(url);
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker is running",
-      version: "6.1-industrial",
+      message: "Proxy API Worker v7.0",
+      version: "7.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
-      min_match_score: MIN_MATCH_SCORE,
+      debug_endpoints: ["/api/debug", "/api/slug-test"],
     });
   },
 };
@@ -231,24 +235,24 @@ function toSlug(s) {
 }
 
 // ===================================================================
-// SLUG CANDIDATES — v6.1 FIX: TITLE-FIRST PRIORITY
+// SLUG CANDIDATES — TITLE-FIRST PRIORITY
 // ===================================================================
 function getSlugCandidates(slug, ...titles) {
   const candidates = new Set();
 
-  // ⚡ PRIORITY: Title-based slugs FIRST
-  // (ToonStream stores content by English/display titles, not AniList romaji)
+  // ⚡ TITLE-BASED SLUGS FIRST (ToonStream uses display titles)
   for (const title of titles) {
     if (!title) continue;
     const aliasTitle = applyAlias(title);
     const normTitle = normalizeTitle(aliasTitle);
     const cleanTitle = removeStopWords(normTitle);
+
     if (title) candidates.add(toSlug(title));
     if (normTitle) candidates.add(toSlug(normTitle));
     if (cleanTitle) candidates.add(toSlug(cleanTitle));
   }
 
-  // DB slug AFTER titles (as fallback)
+  // DB slug AFTER titles
   if (slug) candidates.add(slug);
   const normSlug = normalizeSlug(slug);
   if (normSlug && normSlug !== slug) candidates.add(normSlug);
@@ -467,7 +471,7 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM — v6.1 (Title-first slug + BOTH titles search)
+// TOONSTREAM — v7.0 (Title-first slug + BOTH titles search)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
   // Phase 1: Direct slug attempts (parallel)
@@ -537,6 +541,55 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
   }
 
   return [];
+}
+
+// ===================================================================
+// DEBUG ENDPOINTS
+// ===================================================================
+async function handleDebug(url) {
+  const params = url.searchParams;
+  const slug = params.get("slug") || "";
+  const titleRomaji = params.get("title_romaji") || "";
+  const titleEnglish = params.get("title_english") || "";
+
+  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
+  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
+
+  return jsonResponse({
+    success: true,
+    version: "7.0-industrial",
+    input: { slug, titleRomaji, titleEnglish },
+    generated_slug_candidates: slugCandidates,
+    generated_search_queries: searchQueries,
+  });
+}
+
+async function handleSlugTest(url) {
+  const params = url.searchParams;
+  const slug = params.get("slug") || "";
+  const season = parseInt(params.get("season") || "1");
+  const episode = parseInt(params.get("episode") || "1");
+
+  if (!slug) {
+    return jsonResponse({ success: false, error: "Missing slug" }, 400);
+  }
+
+  const raw = await fetchToonStreamServers(slug, season, episode);
+  const built = buildToonStreamServers(raw);
+
+  return jsonResponse({
+    success: true,
+    slug,
+    season,
+    episode,
+    raw_count: raw.length,
+    approved_count: built.length,
+    raw_servers: raw.map((r) => r.embed_url),
+    approved_servers: built.map((b) => ({
+      name: b.server_name,
+      url: b.embed_url,
+    })),
+  });
 }
 
 // ===================================================================
@@ -640,4 +693,4 @@ async function handleStreamingAPI(url) {
       servers: allServers,
     },
   });
-  }
+}

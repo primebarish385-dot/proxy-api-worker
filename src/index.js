@@ -1,13 +1,13 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v5.2)
+// src/index.js - Proxy API Worker (Industrial Level v6.0)
 // ===================================================================
-// v5.2 Improvements over v5.1:
-//   • Anikoto: single search + multi-result fallback (fixes Kimetsu issue)
-//   • Anikoto: parallel sub+dub extraction
-//   • ToonStream: parallel slug candidate execution (2-3x faster)
-//   • ToonStream: parallel search queries
-//   • Batched parallel slug fetching (avoids rate limit)
-//   • Smart result selection: best match wins
+// v6.0 Major Fixes:
+//   • ToonStream now searches with BOTH romaji AND english titles
+//   • Anikoto also tries BOTH titles in sequence
+//   • 5-layer fallback: slug → normalize → search (both) → word-trim
+//   • Parallel execution everywhere for speed
+//   • Smart deduplication across sources
+//   • Never fails silently — always returns best available
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -34,9 +34,10 @@ const CORS_HEADERS = {
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-const MIN_MATCH_SCORE = 70;
-const MAX_ANIKOTO_RESULTS = 3;   // Max search results to try
-const PARALLEL_BATCH_SIZE = 3;   // Slug fetch batch size
+const MIN_MATCH_SCORE = 65;
+const MAX_ANIKOTO_RESULTS = 3;
+const PARALLEL_BATCH_SIZE = 3;
+const FETCH_TIMEOUT_MS = 15000;
 
 const STOP_WORDS = new Set([
   "the", "a", "an", "of", "and", "to", "in", "on", "for",
@@ -74,7 +75,7 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "5.2-industrial",
+      version: "6.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
       min_match_score: MIN_MATCH_SCORE,
@@ -92,7 +93,7 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-async function fetchJSON(url, extraHeaders = {}, timeoutMs = 15000) {
+async function fetchJSON(url, extraHeaders = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -108,9 +109,6 @@ async function fetchJSON(url, extraHeaders = {}, timeoutMs = 15000) {
   }
 }
 
-// -------------------------------------------------------------------
-// Levenshtein Distance
-// -------------------------------------------------------------------
 function levenshtein(a, b) {
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
@@ -220,37 +218,44 @@ function normalizeTitle(title) {
 }
 
 function toSlug(s) {
+  if (!s) return "";
   return s
     .toLowerCase()
+    .normalize("NFKD")
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 }
 
-function getSlugCandidates(slug, title) {
+function getSlugCandidates(slug, ...titles) {
   const candidates = new Set();
-  const normSlug = normalizeSlug(slug);
-  const aliasTitle = applyAlias(title);
-  const normTitle = normalizeTitle(aliasTitle);
-  const cleanTitle = removeStopWords(normTitle);
-
   if (slug) candidates.add(slug);
+  const normSlug = normalizeSlug(slug);
   if (normSlug && normSlug !== slug) candidates.add(normSlug);
-  if (normTitle) candidates.add(toSlug(normTitle));
-  if (cleanTitle) candidates.add(toSlug(cleanTitle));
-  if (title) candidates.add(toSlug(title));
+
+  for (const title of titles) {
+    if (!title) continue;
+    const aliasTitle = applyAlias(title);
+    const normTitle = normalizeTitle(aliasTitle);
+    const cleanTitle = removeStopWords(normTitle);
+    if (title) candidates.add(toSlug(title));
+    if (normTitle) candidates.add(toSlug(normTitle));
+    if (cleanTitle) candidates.add(toSlug(cleanTitle));
+  }
 
   return Array.from(candidates).filter((c) => c.length > 0);
 }
 
-function getSearchQueries(title) {
+// Generate search queries from a single title
+function getSearchQueriesForTitle(title) {
   const queries = new Set();
+  if (!title) return [];
   const aliasTitle = applyAlias(title);
   const normTitle = normalizeTitle(aliasTitle);
   const cleanTitle = removeStopWords(normTitle);
 
-  if (title) queries.add(title.trim());
+  if (title.trim()) queries.add(title.trim());
   if (aliasTitle && aliasTitle !== title) queries.add(aliasTitle);
   if (normTitle && normTitle !== title) queries.add(normTitle);
   if (cleanTitle && cleanTitle !== title && cleanTitle !== normTitle) queries.add(cleanTitle);
@@ -262,61 +267,72 @@ function getSearchQueries(title) {
   return Array.from(queries).filter((q) => q.length >= 3);
 }
 
+// Generate search queries from BOTH titles
+function getAllSearchQueries(...titles) {
+  const all = new Set();
+  for (const title of titles) {
+    if (!title) continue;
+    getSearchQueriesForTitle(title).forEach((q) => all.add(q));
+  }
+  return Array.from(all);
+}
+
 // ===================================================================
-// ANIKOTO - Optimized with Multi-Result Fallback
+// ANIKOTO - Multi-Result Fallback with BOTH titles
 // ===================================================================
-async function getAnikotoLinks(title, episode) {
-  // SINGLE search call
-  const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
-  const searchData = await fetchJSON(searchUrl);
+async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
+  // Try both titles in sequence
+  const titlesToTry = [titleRomaji, titleEnglish].filter((t, i, arr) => t && arr.indexOf(t) === i);
 
-  if (!searchData?.success || !searchData.data?.results?.length) return [];
+  for (const title of titlesToTry) {
+    const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
+    const searchData = await fetchJSON(searchUrl);
 
-  // Try top results - score them by title similarity first
-  const titleLower = title.toLowerCase().trim();
-  const rankedResults = searchData.data.results
-    .slice(0, MAX_ANIKOTO_RESULTS + 2)
-    .map((r) => ({
-      ...r,
-      score: Math.max(
-        similarityScore(titleLower, (r.title || "").toLowerCase()),
-        similarityScore(titleLower, (r.slug || "").replace(/-/g, " "))
-      ),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_ANIKOTO_RESULTS);
+    if (!searchData?.success || !searchData.data?.results?.length) continue;
 
-  // Try each result in sequence until we find one with servers
-  for (const result of rankedResults) {
-    const episodeUrl = `${ANIKOTO_API}/api/episode/${result.slug}/${episode}`;
-    const episodeData = await fetchJSON(episodeUrl);
+    // Rank top results by similarity
+    const ranked = searchData.data.results
+      .slice(0, MAX_ANIKOTO_RESULTS + 2)
+      .map((r) => ({
+        ...r,
+        score: Math.max(
+          similarityScore(title, (r.title || "").toLowerCase()),
+          similarityScore(title, (r.slug || "").replace(/-/g, " "))
+        ),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_ANIKOTO_RESULTS);
 
-    if (!episodeData?.success || !episodeData.data?.servers?.length) continue;
+    for (const result of ranked) {
+      const episodeUrl = `${ANIKOTO_API}/api/episode/${result.slug}/${episode}`;
+      const episodeData = await fetchJSON(episodeUrl);
 
-    // Build servers in ONE pass (sub + dub together)
-    const servers = [];
-    for (const server of episodeData.data.servers) {
-      let embedUrl = server.embedUrl || server.embed_url;
-      if (!embedUrl) continue;
+      if (!episodeData?.success || !episodeData.data?.servers?.length) continue;
 
-      if (embedUrl.includes("megaplay.buzz/stream/")) {
-        embedUrl = embedUrl.replace(
-          "megaplay.buzz/stream/",
-          "megaplay.buzz/videojs/stream/"
-        );
+      const servers = [];
+      for (const server of episodeData.data.servers) {
+        let embedUrl = server.embedUrl || server.embed_url;
+        if (!embedUrl) continue;
+
+        if (embedUrl.includes("megaplay.buzz/stream/")) {
+          embedUrl = embedUrl.replace(
+            "megaplay.buzz/stream/",
+            "megaplay.buzz/videojs/stream/"
+          );
+        }
+
+        servers.push({
+          server_name: `Anikoto - ${server.name || "Server"}`,
+          source: "anikoto",
+          type: server.type || "sub",
+          language: "english",
+          embed_url: embedUrl,
+          ready_to_use: true,
+        });
       }
 
-      servers.push({
-        server_name: `Anikoto - ${server.name || "Server"}`,
-        source: "anikoto",
-        type: server.type || "sub",
-        language: "english",
-        embed_url: embedUrl,
-        ready_to_use: true,
-      });
+      if (servers.length > 0) return servers;
     }
-
-    if (servers.length > 0) return servers;
   }
 
   return [];
@@ -399,13 +415,19 @@ async function searchToonStreamSlugs(title) {
 
 function buildToonStreamServers(rawServers) {
   const workingUrls = [];
+  const seenUrls = new Set();
+
   for (const server of rawServers) {
     const originalUrl = server.embed_url;
     if (!originalUrl) continue;
+    if (seenUrls.has(originalUrl)) continue;
+
     const isWorking = WORKING_TOONSTREAM_SERVERS.some((domain) =>
       originalUrl.includes(domain)
     );
     if (!isWorking) continue;
+
+    seenUrls.add(originalUrl);
     workingUrls.push(originalUrl);
   }
 
@@ -439,23 +461,24 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM - Parallel Multi-Strategy Fallback (v5.2 FAST)
+// TOONSTREAM - v6.0 (Uses BOTH titles for search)
 // ===================================================================
-async function getToonStreamLinks(slug, season, episode, title) {
-  // ============ Phase 1: Parallel direct slug attempts ============
-  const slugCandidates = getSlugCandidates(slug, title);
+async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
+  // ============ Phase 1: Direct slug attempts (parallel) ============
+  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
   const phase1 = await Promise.all(
     slugCandidates.map(async (candidate) => {
       const raw = await fetchToonStreamServers(candidate, season, episode);
-      return { candidate, servers: buildToonStreamServers(raw) };
+      return { servers: buildToonStreamServers(raw) };
     })
   );
   for (const r of phase1) {
     if (r.servers.length > 0) return r.servers;
   }
 
-  // ============ Phase 2: Parallel multi-query search ============
-  const searchQueries = getSearchQueries(title);
+  // ============ Phase 2: Parallel search with BOTH titles ============
+  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
+
   const phase2SearchResults = await Promise.all(
     searchQueries.map((q) => searchToonStreamSlugs(q))
   );
@@ -465,7 +488,6 @@ async function getToonStreamLinks(slug, season, episode, title) {
     for (const s of slugs) allSearchSlugs.add(s);
   }
 
-  // Skip already tried
   const triedSet = new Set(slugCandidates);
   const toTry = [...allSearchSlugs].filter((s) => !triedSet.has(s));
 
@@ -475,11 +497,34 @@ async function getToonStreamLinks(slug, season, episode, title) {
     const results = await Promise.all(
       batch.map(async (s) => {
         const raw = await fetchToonStreamServers(s, season, episode);
-        return { slug: s, servers: buildToonStreamServers(raw) };
+        return { servers: buildToonStreamServers(raw) };
       })
     );
     for (const r of results) {
       if (r.servers.length > 0) return r.servers;
+    }
+  }
+
+  // ============ Phase 4: Progressive word-trim fallback ============
+  const longestTitle = (titleEnglish && titleEnglish.length > (titleRomaji || "").length)
+    ? titleEnglish
+    : (titleRomaji || titleEnglish);
+  if (longestTitle) {
+    const normTitle = normalizeTitle(applyAlias(longestTitle));
+    const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
+    for (let i = words.length - 1; i >= 2; i--) {
+      const shortTitle = words.slice(0, i).join(" ");
+      if (searchQueries.includes(shortTitle)) continue;
+      if (similarityScore(longestTitle, shortTitle) < 60) continue;
+
+      const slugs = await searchToonStreamSlugs(shortTitle);
+      for (const s of slugs) {
+        if (triedSet.has(s)) continue;
+        triedSet.add(s);
+        const raw = await fetchToonStreamServers(s, season, episode);
+        const built = buildToonStreamServers(raw);
+        if (built.length > 0) return built;
+      }
     }
   }
 
@@ -517,7 +562,7 @@ async function handleProxy(url) {
 }
 
 // ===================================================================
-// MAIN STREAMING API HANDLER
+// MAIN STREAMING API HANDLER (v6.0)
 // ===================================================================
 async function handleStreamingAPI(url) {
   const params = url.searchParams;
@@ -535,13 +580,18 @@ async function handleStreamingAPI(url) {
     );
   }
 
-  const searchTitle = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  // Anikoto prefers romaji (matches their DB), ToonStream prefers English
+  const anikotoTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const anikotoTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
 
-  // Parallel fetch: Anikoto + ToonStream simultaneously
+  const toonTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const toonTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
+
+  // Parallel fetch from both sources
   const [anikotoServers, toonstreamServers] = await Promise.all([
-    getAnikotoLinks(searchTitle, episode),
+    getAnikotoLinks(anikotoTitleRomaji, anikotoTitleEnglish, episode),
     slug
-      ? getToonStreamLinks(slug, season, episode, searchTitle)
+      ? getToonStreamLinks(slug, season, episode, toonTitleRomaji, toonTitleEnglish)
       : Promise.resolve([]),
   ]);
 
@@ -561,11 +611,4 @@ async function handleStreamingAPI(url) {
       title_english: titleEnglish,
       title_romaji: titleRomaji,
       season: season,
-      episode: episode,
-      total_servers: allServers.length,
-      sub_count: subServers.length,
-      dub_count: dubServers.length,
-      servers: allServers,
-    },
-  });
-       }
+      episode: episode

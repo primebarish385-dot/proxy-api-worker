@@ -1,13 +1,7 @@
 // ===================================================================
 // src/index.js - Proxy API Worker (Industrial Level v6.0)
 // ===================================================================
-// v6.0 Major Fixes:
-//   • ToonStream now searches with BOTH romaji AND english titles
-//   • Anikoto also tries BOTH titles in sequence
-//   • 5-layer fallback: slug → normalize → search (both) → word-trim
-//   • Parallel execution everywhere for speed
-//   • Smart deduplication across sources
-//   • Never fails silently — always returns best available
+// Part 1: Constants, Utilities, Helpers
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -247,7 +241,6 @@ function getSlugCandidates(slug, ...titles) {
   return Array.from(candidates).filter((c) => c.length > 0);
 }
 
-// Generate search queries from a single title
 function getSearchQueriesForTitle(title) {
   const queries = new Set();
   if (!title) return [];
@@ -267,7 +260,6 @@ function getSearchQueriesForTitle(title) {
   return Array.from(queries).filter((q) => q.length >= 3);
 }
 
-// Generate search queries from BOTH titles
 function getAllSearchQueries(...titles) {
   const all = new Set();
   for (const title of titles) {
@@ -276,13 +268,13 @@ function getAllSearchQueries(...titles) {
   }
   return Array.from(all);
 }
-
 // ===================================================================
 // ANIKOTO - Multi-Result Fallback with BOTH titles
 // ===================================================================
 async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
-  // Try both titles in sequence
-  const titlesToTry = [titleRomaji, titleEnglish].filter((t, i, arr) => t && arr.indexOf(t) === i);
+  const titlesToTry = [titleRomaji, titleEnglish].filter(
+    (t, i, arr) => t && arr.indexOf(t) === i
+  );
 
   for (const title of titlesToTry) {
     const searchUrl = `${ANIKOTO_API}/api/search?q=${encodeURIComponent(title)}`;
@@ -290,7 +282,6 @@ async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
 
     if (!searchData?.success || !searchData.data?.results?.length) continue;
 
-    // Rank top results by similarity
     const ranked = searchData.data.results
       .slice(0, MAX_ANIKOTO_RESULTS + 2)
       .map((r) => ({
@@ -464,7 +455,7 @@ function buildToonStreamServers(rawServers) {
 // TOONSTREAM - v6.0 (Uses BOTH titles for search)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
-  // ============ Phase 1: Direct slug attempts (parallel) ============
+  // Phase 1: Direct slug attempts (parallel)
   const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
   const phase1 = await Promise.all(
     slugCandidates.map(async (candidate) => {
@@ -476,7 +467,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     if (r.servers.length > 0) return r.servers;
   }
 
-  // ============ Phase 2: Parallel search with BOTH titles ============
+  // Phase 2: Parallel search with BOTH titles
   const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
 
   const phase2SearchResults = await Promise.all(
@@ -491,7 +482,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
   const triedSet = new Set(slugCandidates);
   const toTry = [...allSearchSlugs].filter((s) => !triedSet.has(s));
 
-  // ============ Phase 3: Batched parallel slug fetch ============
+  // Phase 3: Batched parallel slug fetch
   for (let i = 0; i < toTry.length; i += PARALLEL_BATCH_SIZE) {
     const batch = toTry.slice(i, i + PARALLEL_BATCH_SIZE);
     const results = await Promise.all(
@@ -505,10 +496,12 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     }
   }
 
-  // ============ Phase 4: Progressive word-trim fallback ============
-  const longestTitle = (titleEnglish && titleEnglish.length > (titleRomaji || "").length)
-    ? titleEnglish
-    : (titleRomaji || titleEnglish);
+  // Phase 4: Progressive word-trim fallback
+  const longestTitle =
+    titleEnglish && titleEnglish.length > (titleRomaji || "").length
+      ? titleEnglish
+      : titleRomaji || titleEnglish;
+
   if (longestTitle) {
     const normTitle = normalizeTitle(applyAlias(longestTitle));
     const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
@@ -544,7 +537,10 @@ async function handleProxy(url) {
     const targetURL = new URL(targetUrl);
     const headers = new Headers();
     headers.set("User-Agent", USER_AGENT);
-    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    headers.set(
+      "Accept",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    );
     headers.set("Accept-Language", "en-US,en;q=0.9");
     headers.set("Referer", targetURL.origin + "/");
 
@@ -555,7 +551,10 @@ async function handleProxy(url) {
     newHeaders.delete("Content-Security-Policy-Report-Only");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
-    return new Response(response.body, { status: response.status, headers: newHeaders });
+    return new Response(response.body, {
+      status: response.status,
+      headers: newHeaders,
+    });
   } catch (e) {
     return jsonResponse({ success: false, error: e.message }, 500);
   }
@@ -580,18 +579,26 @@ async function handleStreamingAPI(url) {
     );
   }
 
-  // Anikoto prefers romaji (matches their DB), ToonStream prefers English
-  const anikotoTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
-  const anikotoTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
+  const anikotoTitleRomaji =
+    titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const anikotoTitleEnglish =
+    titleEnglish || titleRomaji || slug.replace(/-/g, " ");
 
-  const toonTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
-  const toonTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
+  const toonTitleRomaji =
+    titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const toonTitleEnglish =
+    titleEnglish || titleRomaji || slug.replace(/-/g, " ");
 
-  // Parallel fetch from both sources
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(anikotoTitleRomaji, anikotoTitleEnglish, episode),
     slug
-      ? getToonStreamLinks(slug, season, episode, toonTitleRomaji, toonTitleEnglish)
+      ? getToonStreamLinks(
+          slug,
+          season,
+          episode,
+          toonTitleRomaji,
+          toonTitleEnglish
+        )
       : Promise.resolve([]),
   ]);
 
@@ -611,4 +618,11 @@ async function handleStreamingAPI(url) {
       title_english: titleEnglish,
       title_romaji: titleRomaji,
       season: season,
-      episode: episode
+      episode: episode,
+      total_servers: allServers.length,
+      sub_count: subServers.length,
+      dub_count: dubServers.length,
+      servers: allServers,
+    },
+  });
+}

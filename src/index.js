@@ -1,21 +1,19 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v4.0)
+// src/index.js - Proxy API Worker (Industrial Level v5.0)
 // ===================================================================
 // Features:
-//   • Anikoto      → Eng Sub + Eng Dub (/videojs/ auto-inject)
+//   • Anikoto      → Eng Sub + Eng Dub
 //   • ToonStream   → Multi Audio (8 working servers)
-//   • Auto-Numbering for duplicate servers (FilesForever 1, 2, 3...)
-//   • Multi-Slug Search Fallback (tries ALL matches, not just first)
-//   • Title Match Scoring (best slug wins)
-//   • Parallel Fetching (Anikoto + ToonStream simultaneously)
-//   • CORS enabled for cross-account Workers
+//   • Auto Slug/Title Normalization (Season/Part/Cour/Final stripped)
+//   • Multi-Strategy Fallback (5 layers of fallback)
+//   • Auto-Numbering for duplicate servers
+//   • Parallel Fetching + CORS
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
 const TOONSTREAM_SITE = "https://toonstream.us";
 
-// ToonStream servers that work directly inside <iframe> without proxy
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
   "vidara.to",
@@ -54,11 +52,7 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "4.0-industrial",
-      endpoints: {
-        streaming: "/api/streaming?slug=...&title=...&season=...&episode=...",
-        proxy: "/proxy?url=ENCODED_URL",
-      },
+      version: "5.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
     });
@@ -87,6 +81,109 @@ async function fetchJSON(url, extraHeaders = {}) {
   }
 }
 
+// -------------------------------------------------------------------
+// SLUG NORMALIZATION - Season/Part/Cour/Final-Season ইত্যাদি বাদ দেয়
+// -------------------------------------------------------------------
+function normalizeSlug(slug) {
+  let s = slug.toLowerCase().trim();
+  const patterns = [
+    /-(\d+)(st|nd|rd|th)-season$/,
+    /-season-\d+$/,
+    /-the-final-season$/,
+    /-final-season-part-\d+$/,
+    /-final-season$/,
+    /-part-\d+$/,
+    /-cour-\d+$/,
+    /-\d+nd-season$/,
+    /-\d+rd-season$/,
+    /-\d+th-season$/,
+    /-season$/,
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const p of patterns) {
+      const next = s.replace(p, "");
+      if (next !== s) {
+        s = next;
+        changed = true;
+      }
+    }
+  }
+  return s;
+}
+
+// -------------------------------------------------------------------
+// TITLE NORMALIZATION - একই কাজ টাইটেলের জন্য
+// -------------------------------------------------------------------
+function normalizeTitle(title) {
+  let t = title.trim();
+  const patterns = [
+    /\s+\d+(st|nd|rd|th)\s+Season$/i,
+    /\s+Season\s+\d+\s+Part\s+\d+$/i,
+    /\s+Season\s+\d+$/i,
+    /\s+The\s+Final\s+Season$/i,
+    /\s+Final\s+Season\s+Part\s+\d+$/i,
+    /\s+Final\s+Season$/i,
+    /\s+Part\s+\d+$/i,
+    /\s+Cour\s+\d+$/i,
+    /\s+Season$/i,
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const p of patterns) {
+      const next = t.replace(p, "");
+      if (next !== t) {
+        t = next;
+        changed = true;
+      }
+    }
+  }
+  return t.trim();
+}
+
+// -------------------------------------------------------------------
+// SLUG CANDIDATES - Multiple variations to try
+// -------------------------------------------------------------------
+function getSlugCandidates(slug, title) {
+  const candidates = new Set();
+  const normSlug = normalizeSlug(slug);
+  const normTitle = normalizeTitle(title);
+
+  // 1. Original slug
+  if (slug) candidates.add(slug);
+
+  // 2. Normalized slug
+  if (normSlug && normSlug !== slug) candidates.add(normSlug);
+
+  // 3. Title-based slug (normalized)
+  if (normTitle) {
+    const titleSlug = normTitle
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    if (titleSlug) candidates.add(titleSlug);
+  }
+
+  // 4. Original title-based slug
+  if (title) {
+    const rawTitleSlug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    if (rawTitleSlug) candidates.add(rawTitleSlug);
+  }
+
+  return Array.from(candidates);
+}
+
 // ===================================================================
 // ANIKOTO - Eng Sub + Eng Dub
 // ===================================================================
@@ -112,7 +209,6 @@ async function getAnikotoLinks(title, episode) {
         let embedUrl = server.embedUrl || server.embed_url;
         if (!embedUrl) continue;
 
-        // Inject /videojs/ for megaplay.buzz
         if (embedUrl.includes("megaplay.buzz/stream/")) {
           embedUrl = embedUrl.replace(
             "megaplay.buzz/stream/",
@@ -129,9 +225,7 @@ async function getAnikotoLinks(title, episode) {
           ready_to_use: true,
         });
       }
-    } catch (e) {
-      // Silent fail — try next type
-    }
+    } catch (e) {}
   }
 
   return servers;
@@ -152,7 +246,6 @@ function getToonStreamServerName(url) {
   return "Unknown";
 }
 
-// Fetch raw servers from ToonStream Scraper API
 async function fetchToonStreamServers(slug, season, episode) {
   try {
     const apiUrl = `${TOONSTREAM_API}/api/streaming?slug=${encodeURIComponent(slug)}&season=${season}&episode=${episode}`;
@@ -164,7 +257,7 @@ async function fetchToonStreamServers(slug, season, episode) {
   return [];
 }
 
-// Search ToonStream → returns array of slugs sorted by title match score
+// ToonStream Search API - returns slugs sorted by title-match score
 async function searchToonStreamSlugs(title) {
   try {
     const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
@@ -189,20 +282,17 @@ async function searchToonStreamSlugs(title) {
       const match = itemUrl.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
       if (!match || !match[1]) continue;
 
-      // Title match scoring
       let score = 30;
       if (itemTitle === titleLower) score = 100;
       else if (itemTitle.startsWith(titleLower)) score = 90;
       else if (itemTitle.includes(titleLower)) score = 80;
       else if (titleLower.includes(itemTitle)) score = 70;
 
-      // Bonus for matching type (series vs movie)
       if (item.type === "series") score += 5;
 
       scored.push({ slug: match[1], title: itemTitle, score });
     }
 
-    // Sort by score DESC, then deduplicate
     scored.sort((a, b) => b.score - a.score);
     const seen = new Set();
     const unique = [];
@@ -218,9 +308,8 @@ async function searchToonStreamSlugs(title) {
   }
 }
 
-// Filter + auto-numbering for ToonStream servers
+// Filter + auto-numbering
 function buildToonStreamServers(rawServers) {
-  // Step 1: Filter only working servers
   const workingUrls = [];
   for (const server of rawServers) {
     const originalUrl = server.embed_url;
@@ -235,14 +324,12 @@ function buildToonStreamServers(rawServers) {
 
   if (workingUrls.length === 0) return [];
 
-  // Step 2: Count domains
   const domainCounts = {};
   for (const url of workingUrls) {
     const baseName = getToonStreamServerName(url);
     domainCounts[baseName] = (domainCounts[baseName] || 0) + 1;
   }
 
-  // Step 3: Add numbering when duplicates exist
   const domainIndexes = {};
   const servers = [];
   for (const originalUrl of workingUrls) {
@@ -263,27 +350,66 @@ function buildToonStreamServers(rawServers) {
       ready_to_use: true,
     });
   }
-
   return servers;
 }
 
 // ===================================================================
-// TOONSTREAM - Multi Audio with Multi-Slug Fallback
+// TOONSTREAM - Multi-Strategy Fallback (v5.0 core logic)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, title) {
-  // Step 1: Try direct slug
-  let rawServers = await fetchToonStreamServers(slug, season, episode);
-  let servers = buildToonStreamServers(rawServers);
-  if (servers.length > 0) return servers;
+  const triedSlugs = new Set();
 
-  // Step 2: Search fallback — try ALL matching slugs until one works
+  // ========== Strategy 1: Slug Candidates (Original + Normalized + Title-based) ==========
+  const slugCandidates = getSlugCandidates(slug, title);
+  for (const candidate of slugCandidates) {
+    if (triedSlugs.has(candidate)) continue;
+    triedSlugs.add(candidate);
+
+    const raw = await fetchToonStreamServers(candidate, season, episode);
+    const built = buildToonStreamServers(raw);
+    if (built.length > 0) return built;
+  }
+
+  // ========== Strategy 2: Search with Original Title ==========
   if (title) {
-    const candidateSlugs = await searchToonStreamSlugs(title);
-    for (const candidate of candidateSlugs) {
-      if (candidate === slug) continue; // already tried
-      rawServers = await fetchToonStreamServers(candidate, season, episode);
-      servers = buildToonStreamServers(rawServers);
-      if (servers.length > 0) return servers;
+    const searchSlugs1 = await searchToonStreamSlugs(title);
+    for (const s of searchSlugs1) {
+      if (triedSlugs.has(s)) continue;
+      triedSlugs.add(s);
+      const raw = await fetchToonStreamServers(s, season, episode);
+      const built = buildToonStreamServers(raw);
+      if (built.length > 0) return built;
+    }
+  }
+
+  // ========== Strategy 3: Search with Normalized Title ==========
+  const normTitle = normalizeTitle(title || "");
+  if (normTitle && normTitle !== title) {
+    const searchSlugs2 = await searchToonStreamSlugs(normTitle);
+    for (const s of searchSlugs2) {
+      if (triedSlugs.has(s)) continue;
+      triedSlugs.add(s);
+      const raw = await fetchToonStreamServers(s, season, episode);
+      const built = buildToonStreamServers(raw);
+      if (built.length > 0) return built;
+    }
+  }
+
+  // ========== Strategy 4: Progressive Word-Trim Fallback ==========
+  if (title) {
+    const words = title.trim().split(/\s+/);
+    for (let i = words.length - 1; i >= 2; i--) {
+      const shortTitle = words.slice(0, i).join(" ");
+      if (shortTitle === title || shortTitle === normTitle) continue;
+
+      const searchSlugs3 = await searchToonStreamSlugs(shortTitle);
+      for (const s of searchSlugs3) {
+        if (triedSlugs.has(s)) continue;
+        triedSlugs.add(s);
+        const raw = await fetchToonStreamServers(s, season, episode);
+        const built = buildToonStreamServers(raw);
+        if (built.length > 0) return built;
+      }
     }
   }
 
@@ -303,25 +429,18 @@ async function handleProxy(url) {
     const targetURL = new URL(targetUrl);
     const headers = new Headers();
     headers.set("User-Agent", USER_AGENT);
-    headers.set(
-      "Accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    );
+    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
     headers.set("Accept-Language", "en-US,en;q=0.9");
     headers.set("Referer", targetURL.origin + "/");
 
     const response = await fetch(targetUrl, { headers, redirect: "follow" });
-
     const newHeaders = new Headers(response.headers);
     newHeaders.delete("X-Frame-Options");
     newHeaders.delete("Content-Security-Policy");
     newHeaders.delete("Content-Security-Policy-Report-Only");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
-    return new Response(response.body, {
-      status: response.status,
-      headers: newHeaders,
-    });
+    return new Response(response.body, { status: response.status, headers: newHeaders });
   } catch (e) {
     return jsonResponse({ success: false, error: e.message }, 500);
   }
@@ -348,7 +467,6 @@ async function handleStreamingAPI(url) {
 
   const searchTitle = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
 
-  // Parallel fetch: Anikoto + ToonStream simultaneously
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(searchTitle, episode),
     slug
@@ -379,4 +497,4 @@ async function handleStreamingAPI(url) {
       servers: allServers,
     },
   });
-      }
+}

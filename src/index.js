@@ -1,13 +1,14 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v5.0)
+// src/index.js - Proxy API Worker (Industrial Level v5.1)
 // ===================================================================
-// Features:
-//   • Anikoto      → Eng Sub + Eng Dub
-//   • ToonStream   → Multi Audio (8 working servers)
-//   • Auto Slug/Title Normalization (Season/Part/Cour/Final stripped)
-//   • Multi-Strategy Fallback (5 layers of fallback)
-//   • Auto-Numbering for duplicate servers
-//   • Parallel Fetching + CORS
+// v5.1 Improvements over v5.0:
+//   • Levenshtein distance similarity
+//   • Token-overlap scoring
+//   • Stop-word removal for matching
+//   • Multi-query search expansion
+//   • Confidence threshold (70%+ match required)
+//   • Common alias mapping
+//   • Progressive word-trim with score validation
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -34,6 +35,30 @@ const CORS_HEADERS = {
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+// Minimum similarity score (0-100) to accept a match
+const MIN_MATCH_SCORE = 70;
+
+// Stop words to ignore during matching
+const STOP_WORDS = new Set([
+  "the", "a", "an", "of", "and", "to", "in", "on", "for",
+  "with", "by", "at", "from", "as", "is", "it", "its",
+  "movie", "series", "episode", "anime", "ova", "ona", "special",
+]);
+
+// Common alias/short form mappings
+const TITLE_ALIASES = {
+  "aot": "attack on titan",
+  "jjk": "jujutsu kaisen",
+  "mha": "my hero academia",
+  "fmab": "fullmetal alchemist brotherhood",
+  "hxh": "hunter x hunter",
+  "op": "one piece",
+  "ds": "demon slayer",
+  "kny": "kimetsu no yaiba",
+  "tbhk": "toilet bound hanako kun",
+  "rent a girlfriend": "kanojo okarishimasu",
+};
+
 // ===================================================================
 // ENTRY POINT
 // ===================================================================
@@ -52,9 +77,10 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "5.0-industrial",
+      version: "5.1-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
+      min_match_score: MIN_MATCH_SCORE,
     });
   },
 };
@@ -82,7 +108,89 @@ async function fetchJSON(url, extraHeaders = {}) {
 }
 
 // -------------------------------------------------------------------
-// SLUG NORMALIZATION - Season/Part/Cour/Final-Season ইত্যাদি বাদ দেয়
+// Levenshtein Distance (edit distance)
+// -------------------------------------------------------------------
+function levenshtein(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+// -------------------------------------------------------------------
+// Similarity Score (0-100) - combines multiple signals
+// -------------------------------------------------------------------
+function similarityScore(a, b) {
+  if (!a || !b) return 0;
+
+  const s1 = a.toLowerCase().trim();
+  const s2 = b.toLowerCase().trim();
+
+  if (s1 === s2) return 100;
+
+  // Levenshtein-based score
+  const maxLen = Math.max(s1.length, s2.length);
+  const distance = levenshtein(s1, s2);
+  const levScore = ((maxLen - distance) / maxLen) * 100;
+
+  // Token-overlap score
+  const tokens1 = s1.split(/\s+/).filter((t) => t.length > 0);
+  const tokens2 = s2.split(/\s+/).filter((t) => t.length > 0);
+  const set1 = new Set(tokens1);
+  const set2 = new Set(tokens2);
+  const intersection = [...set1].filter((t) => set2.has(t)).length;
+  const union = new Set([...set1, ...set2]).size;
+  const tokenScore = union > 0 ? (intersection / union) * 100 : 0;
+
+  // Substring bonus
+  let substringBonus = 0;
+  if (s1.includes(s2) || s2.includes(s1)) substringBonus = 15;
+
+  // Combined score (weighted average)
+  const finalScore = levScore * 0.5 + tokenScore * 0.5 + substringBonus;
+  return Math.min(100, Math.round(finalScore));
+}
+
+// -------------------------------------------------------------------
+// Remove stop words from title
+// -------------------------------------------------------------------
+function removeStopWords(title) {
+  return title
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 0 && !STOP_WORDS.has(w))
+    .join(" ")
+    .trim();
+}
+
+// -------------------------------------------------------------------
+// Apply alias mapping
+// -------------------------------------------------------------------
+function applyAlias(title) {
+  const lower = title.toLowerCase().trim();
+  if (TITLE_ALIASES[lower]) return TITLE_ALIASES[lower];
+  return title;
+}
+
+// -------------------------------------------------------------------
+// SLUG NORMALIZATION
 // -------------------------------------------------------------------
 function normalizeSlug(slug) {
   let s = slug.toLowerCase().trim();
@@ -115,7 +223,7 @@ function normalizeSlug(slug) {
 }
 
 // -------------------------------------------------------------------
-// TITLE NORMALIZATION - একই কাজ টাইটেলের জন্য
+// TITLE NORMALIZATION
 // -------------------------------------------------------------------
 function normalizeTitle(title) {
   let t = title.trim();
@@ -146,42 +254,53 @@ function normalizeTitle(title) {
 }
 
 // -------------------------------------------------------------------
-// SLUG CANDIDATES - Multiple variations to try
+// SLUG CANDIDATES - Multiple variations
 // -------------------------------------------------------------------
 function getSlugCandidates(slug, title) {
   const candidates = new Set();
   const normSlug = normalizeSlug(slug);
-  const normTitle = normalizeTitle(title);
+  const aliasTitle = applyAlias(title);
+  const normTitle = normalizeTitle(aliasTitle);
+  const cleanTitle = removeStopWords(normTitle);
 
-  // 1. Original slug
+  function toSlug(s) {
+    return s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+  }
+
   if (slug) candidates.add(slug);
-
-  // 2. Normalized slug
   if (normSlug && normSlug !== slug) candidates.add(normSlug);
+  if (normTitle) candidates.add(toSlug(normTitle));
+  if (cleanTitle) candidates.add(toSlug(cleanTitle));
+  if (title) candidates.add(toSlug(title));
 
-  // 3. Title-based slug (normalized)
-  if (normTitle) {
-    const titleSlug = normTitle
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    if (titleSlug) candidates.add(titleSlug);
-  }
+  return Array.from(candidates).filter((c) => c.length > 0);
+}
 
-  // 4. Original title-based slug
-  if (title) {
-    const rawTitleSlug = title
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    if (rawTitleSlug) candidates.add(rawTitleSlug);
-  }
+// -------------------------------------------------------------------
+// MULTI-QUERY SEARCH - Generate multiple search queries
+// -------------------------------------------------------------------
+function getSearchQueries(title) {
+  const queries = new Set();
+  const aliasTitle = applyAlias(title);
+  const normTitle = normalizeTitle(aliasTitle);
+  const cleanTitle = removeStopWords(normTitle);
 
-  return Array.from(candidates);
+  if (title) queries.add(title.trim());
+  if (aliasTitle && aliasTitle !== title) queries.add(aliasTitle);
+  if (normTitle && normTitle !== title) queries.add(normTitle);
+  if (cleanTitle && cleanTitle !== title && cleanTitle !== normTitle) queries.add(cleanTitle);
+
+  // First 4 words, first 3 words (for long titles)
+  const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length >= 5) queries.add(words.slice(0, 4).join(" "));
+  if (words.length >= 4) queries.add(words.slice(0, 3).join(" "));
+
+  return Array.from(queries).filter((q) => q.length >= 3);
 }
 
 // ===================================================================
@@ -257,7 +376,7 @@ async function fetchToonStreamServers(slug, season, episode) {
   return [];
 }
 
-// ToonStream Search API - returns slugs sorted by title-match score
+// ToonStream Search API with similarity scoring
 async function searchToonStreamSlugs(title) {
   try {
     const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
@@ -273,30 +392,40 @@ async function searchToonStreamSlugs(title) {
     const json = await res.json();
     if (!Array.isArray(json.data) || json.data.length === 0) return [];
 
-    const titleLower = title.toLowerCase().trim();
+    const titleClean = removeStopWords(normalizeTitle(title));
     const scored = [];
 
     for (const item of json.data) {
       const itemUrl = item.url || "";
-      const itemTitle = (item.title || "").toLowerCase().trim();
+      const itemTitle = (item.title || "").trim();
       const match = itemUrl.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
       if (!match || !match[1]) continue;
 
-      let score = 30;
-      if (itemTitle === titleLower) score = 100;
-      else if (itemTitle.startsWith(titleLower)) score = 90;
-      else if (itemTitle.includes(titleLower)) score = 80;
-      else if (titleLower.includes(itemTitle)) score = 70;
+      const itemTitleClean = removeStopWords(itemTitle);
 
-      if (item.type === "series") score += 5;
+      // Multi-signal similarity
+      const score1 = similarityScore(title, itemTitle);
+      const score2 = similarityScore(titleClean, itemTitleClean);
+      const score = Math.max(score1, score2);
 
-      scored.push({ slug: match[1], title: itemTitle, score });
+      // Series bonus
+      const finalScore = score + (item.type === "series" ? 3 : 0);
+
+      scored.push({
+        slug: match[1],
+        title: itemTitle,
+        score: finalScore,
+      });
     }
 
-    scored.sort((a, b) => b.score - a.score);
+    // Filter by confidence threshold
+    const filtered = scored.filter((s) => s.score >= MIN_MATCH_SCORE);
+    filtered.sort((a, b) => b.score - a.score);
+
+    // Deduplicate
     const seen = new Set();
     const unique = [];
-    for (const item of scored) {
+    for (const item of filtered) {
       if (!seen.has(item.slug)) {
         seen.add(item.slug);
         unique.push(item.slug);
@@ -308,7 +437,7 @@ async function searchToonStreamSlugs(title) {
   }
 }
 
-// Filter + auto-numbering
+// Build servers with filter + auto-numbering
 function buildToonStreamServers(rawServers) {
   const workingUrls = [];
   for (const server of rawServers) {
@@ -354,12 +483,12 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM - Multi-Strategy Fallback (v5.0 core logic)
+// TOONSTREAM - Multi-Strategy Fallback (v5.1 core)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, title) {
   const triedSlugs = new Set();
 
-  // ========== Strategy 1: Slug Candidates (Original + Normalized + Title-based) ==========
+  // ========== Strategy 1: Direct slug candidates ==========
   const slugCandidates = getSlugCandidates(slug, title);
   for (const candidate of slugCandidates) {
     if (triedSlugs.has(candidate)) continue;
@@ -370,10 +499,11 @@ async function getToonStreamLinks(slug, season, episode, title) {
     if (built.length > 0) return built;
   }
 
-  // ========== Strategy 2: Search with Original Title ==========
-  if (title) {
-    const searchSlugs1 = await searchToonStreamSlugs(title);
-    for (const s of searchSlugs1) {
+  // ========== Strategy 2: Multi-Query Search ==========
+  const searchQueries = getSearchQueries(title);
+  for (const query of searchQueries) {
+    const searchSlugs = await searchToonStreamSlugs(query);
+    for (const s of searchSlugs) {
       if (triedSlugs.has(s)) continue;
       triedSlugs.add(s);
       const raw = await fetchToonStreamServers(s, season, episode);
@@ -382,28 +512,19 @@ async function getToonStreamLinks(slug, season, episode, title) {
     }
   }
 
-  // ========== Strategy 3: Search with Normalized Title ==========
-  const normTitle = normalizeTitle(title || "");
-  if (normTitle && normTitle !== title) {
-    const searchSlugs2 = await searchToonStreamSlugs(normTitle);
-    for (const s of searchSlugs2) {
-      if (triedSlugs.has(s)) continue;
-      triedSlugs.add(s);
-      const raw = await fetchToonStreamServers(s, season, episode);
-      const built = buildToonStreamServers(raw);
-      if (built.length > 0) return built;
-    }
-  }
-
-  // ========== Strategy 4: Progressive Word-Trim Fallback ==========
+  // ========== Strategy 3: Progressive Word-Trim with Score Check ==========
   if (title) {
-    const words = title.trim().split(/\s+/);
+    const normTitle = normalizeTitle(applyAlias(title));
+    const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
     for (let i = words.length - 1; i >= 2; i--) {
       const shortTitle = words.slice(0, i).join(" ");
-      if (shortTitle === title || shortTitle === normTitle) continue;
+      if (searchQueries.includes(shortTitle)) continue;
 
-      const searchSlugs3 = await searchToonStreamSlugs(shortTitle);
-      for (const s of searchSlugs3) {
+      // Only accept if short title has good similarity
+      if (similarityScore(title, shortTitle) < 60) continue;
+
+      const searchSlugs = await searchToonStreamSlugs(shortTitle);
+      for (const s of searchSlugs) {
         if (triedSlugs.has(s)) continue;
         triedSlugs.add(s);
         const raw = await fetchToonStreamServers(s, season, episode);
@@ -497,4 +618,4 @@ async function handleStreamingAPI(url) {
       servers: allServers,
     },
   });
-}
+          }

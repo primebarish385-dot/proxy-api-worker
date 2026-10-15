@@ -1,7 +1,9 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v6.0)
+// src/index.js - Proxy API Worker (Industrial Level v6.1)
 // ===================================================================
-// Part 1: Constants, Utilities, Helpers
+// v6.1 Fix:
+//   • getSlugCandidates: TITLE-based slugs FIRST, then DB slug
+//     (Because ToonStream uses English titles, not AniList romaji)
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -69,7 +71,7 @@ export default {
     return jsonResponse({
       success: true,
       message: "Proxy API Worker is running",
-      version: "6.0-industrial",
+      version: "6.1-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
       min_match_score: MIN_MATCH_SCORE,
@@ -181,7 +183,10 @@ function normalizeSlug(slug) {
     changed = false;
     for (const p of patterns) {
       const next = s.replace(p, "");
-      if (next !== s) { s = next; changed = true; }
+      if (next !== s) {
+        s = next;
+        changed = true;
+      }
     }
   }
   return s;
@@ -205,7 +210,10 @@ function normalizeTitle(title) {
     changed = false;
     for (const p of patterns) {
       const next = t.replace(p, "");
-      if (next !== t) { t = next; changed = true; }
+      if (next !== t) {
+        t = next;
+        changed = true;
+      }
     }
   }
   return t.trim();
@@ -222,12 +230,14 @@ function toSlug(s) {
     .replace(/^-|-$/g, "");
 }
 
+// ===================================================================
+// SLUG CANDIDATES — v6.1 FIX: TITLE-FIRST PRIORITY
+// ===================================================================
 function getSlugCandidates(slug, ...titles) {
   const candidates = new Set();
-  if (slug) candidates.add(slug);
-  const normSlug = normalizeSlug(slug);
-  if (normSlug && normSlug !== slug) candidates.add(normSlug);
 
+  // ⚡ PRIORITY: Title-based slugs FIRST
+  // (ToonStream stores content by English/display titles, not AniList romaji)
   for (const title of titles) {
     if (!title) continue;
     const aliasTitle = applyAlias(title);
@@ -237,6 +247,11 @@ function getSlugCandidates(slug, ...titles) {
     if (normTitle) candidates.add(toSlug(normTitle));
     if (cleanTitle) candidates.add(toSlug(cleanTitle));
   }
+
+  // DB slug AFTER titles (as fallback)
+  if (slug) candidates.add(slug);
+  const normSlug = normalizeSlug(slug);
+  if (normSlug && normSlug !== slug) candidates.add(normSlug);
 
   return Array.from(candidates).filter((c) => c.length > 0);
 }
@@ -269,7 +284,7 @@ function getAllSearchQueries(...titles) {
   return Array.from(all);
 }
 // ===================================================================
-// ANIKOTO - Multi-Result Fallback with BOTH titles
+// ANIKOTO — Multi-Result Fallback with BOTH titles
 // ===================================================================
 async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
   const titlesToTry = [titleRomaji, titleEnglish].filter(
@@ -452,7 +467,7 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM - v6.0 (Uses BOTH titles for search)
+// TOONSTREAM — v6.1 (Title-first slug + BOTH titles search)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
   // Phase 1: Direct slug attempts (parallel)
@@ -561,7 +576,7 @@ async function handleProxy(url) {
 }
 
 // ===================================================================
-// MAIN STREAMING API HANDLER (v6.0)
+// MAIN STREAMING API HANDLER
 // ===================================================================
 async function handleStreamingAPI(url) {
   const params = url.searchParams;
@@ -625,4 +640,4 @@ async function handleStreamingAPI(url) {
       servers: allServers,
     },
   });
-}
+  }

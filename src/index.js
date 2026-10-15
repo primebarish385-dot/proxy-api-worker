@@ -1,11 +1,13 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v7.0 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v8.0 - FINAL)
 // ===================================================================
-// v7.0 Features:
+// v8.0 Features:
 //   • Auto-slug discovery (Title-first priority)
-//   • Debug endpoints for troubleshooting
-//   • 6-layer fallback for ToonStream
-//   • BOTH titles used for search
+//   • Dub variant queries (hindi dub, muse dub, sony yay dub)
+//   • Search scoring BOOST for dub entries
+//   • Best-tracking (not first-found return)
+//   • 6-layer fallback chain
+//   • Debug endpoints
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -32,7 +34,7 @@ const CORS_HEADERS = {
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-const MIN_MATCH_SCORE = 65;
+const MIN_MATCH_SCORE = 55;
 const MAX_ANIKOTO_RESULTS = 3;
 const PARALLEL_BATCH_SIZE = 3;
 const FETCH_TIMEOUT_MS = 15000;
@@ -74,10 +76,11 @@ export default {
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v7.0",
-      version: "7.0-industrial",
+      message: "Proxy API Worker v8.0",
+      version: "8.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
+      min_match_score: MIN_MATCH_SCORE,
       debug_endpoints: ["/api/debug", "/api/slug-test"],
     });
   },
@@ -235,12 +238,12 @@ function toSlug(s) {
 }
 
 // ===================================================================
-// SLUG CANDIDATES — TITLE-FIRST PRIORITY
+// SLUG CANDIDATES — TITLE-FIRST PRIORITY + DUB VARIANTS
 // ===================================================================
 function getSlugCandidates(slug, ...titles) {
   const candidates = new Set();
 
-  // ⚡ TITLE-BASED SLUGS FIRST (ToonStream uses display titles)
+  // TITLE-BASED SLUGS FIRST
   for (const title of titles) {
     if (!title) continue;
     const aliasTitle = applyAlias(title);
@@ -250,6 +253,17 @@ function getSlugCandidates(slug, ...titles) {
     if (title) candidates.add(toSlug(title));
     if (normTitle) candidates.add(toSlug(normTitle));
     if (cleanTitle) candidates.add(toSlug(cleanTitle));
+
+    // NEW: Dub variant slugs
+    const dubSuffixes = ["hindi-dub", "muse-dub", "sony-yay-dub", "dub"];
+    for (const base of [normTitle, cleanTitle, aliasTitle]) {
+      if (!base || base.length < 3) continue;
+      const baseSlug = toSlug(base);
+      if (!baseSlug) continue;
+      for (const suffix of dubSuffixes) {
+        candidates.add(`${baseSlug}-${suffix}`);
+      }
+    }
   }
 
   // DB slug AFTER titles
@@ -275,6 +289,17 @@ function getSearchQueriesForTitle(title) {
   const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
   if (words.length >= 5) queries.add(words.slice(0, 4).join(" "));
   if (words.length >= 4) queries.add(words.slice(0, 3).join(" "));
+
+  // Dub variant queries
+  const dubSuffixes = ["Hindi Dub", "Muse Dub", "Sony Yay Dub", "Dub", "Hindi"];
+  const baseTitles = [normTitle, cleanTitle, aliasTitle].filter(
+    (t, i, arr) => t && t.length >= 3 && arr.indexOf(t) === i
+  );
+  for (const base of baseTitles) {
+    for (const suffix of dubSuffixes) {
+      queries.add(`${base} ${suffix}`);
+    }
+  }
 
   return Array.from(queries).filter((q) => q.length >= 3);
 }
@@ -374,6 +399,9 @@ async function fetchToonStreamServers(slug, season, episode) {
   return [];
 }
 
+// ===================================================================
+// SEARCH TOONSTREAM — with DUB entry BOOST
+// ===================================================================
 async function searchToonStreamSlugs(title) {
   try {
     const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
@@ -395,13 +423,25 @@ async function searchToonStreamSlugs(title) {
     for (const item of json.data) {
       const itemUrl = item.url || "";
       const itemTitle = (item.title || "").trim();
+      const itemTitleLower = itemTitle.toLowerCase();
       const match = itemUrl.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
       if (!match || !match[1]) continue;
 
       const itemTitleClean = removeStopWords(itemTitle);
       const score1 = similarityScore(title, itemTitle);
       const score2 = similarityScore(titleClean, itemTitleClean);
-      const score = Math.max(score1, score2) + (item.type === "series" ? 3 : 0);
+      let score = Math.max(score1, score2);
+
+      // Boost dub / multi-audio variant entries
+      if (itemTitleLower.includes("hindi dub")) score += 25;
+      else if (itemTitleLower.includes("hindi")) score += 20;
+      else if (itemTitleLower.includes("muse dub")) score += 22;
+      else if (itemTitleLower.includes("sony yay dub")) score += 22;
+      else if (itemTitleLower.includes("dub")) score += 15;
+      else if (itemTitleLower.includes("multi audio")) score += 15;
+
+      // Series bonus
+      if (item.type === "series") score += 3;
 
       scored.push({ slug: match[1], title: itemTitle, score });
     }
@@ -471,24 +511,29 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM — v7.0 (Title-first slug + BOTH titles search)
+// TOONSTREAM MAIN — Best-tracking 6-layer fallback
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
-  // Phase 1: Direct slug attempts (parallel)
+  // ============ Phase 1: Direct slug attempts (parallel) ============
   const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
   const phase1 = await Promise.all(
     slugCandidates.map(async (candidate) => {
       const raw = await fetchToonStreamServers(candidate, season, episode);
-      return { servers: buildToonStreamServers(raw) };
+      return { slug: candidate, servers: buildToonStreamServers(raw) };
     })
   );
+
+  // Track BEST result (not first-found)
+  let best = { slug: null, servers: [] };
   for (const r of phase1) {
-    if (r.servers.length > 0) return r.servers;
+    if (r.servers.length > best.servers.length) best = r;
   }
 
-  // Phase 2: Parallel search with BOTH titles
-  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
+  // Early exit ONLY if already good enough (>= 5 servers)
+  if (best.servers.length >= 5) return best.servers;
 
+  // ============ Phase 2: Search with BOTH titles + dub variants ============
+  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
   const phase2SearchResults = await Promise.all(
     searchQueries.map((q) => searchToonStreamSlugs(q))
   );
@@ -501,46 +546,51 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
   const triedSet = new Set(slugCandidates);
   const toTry = [...allSearchSlugs].filter((s) => !triedSet.has(s));
 
-  // Phase 3: Batched parallel slug fetch
+  // ============ Phase 3: Batched parallel — track BEST ============
   for (let i = 0; i < toTry.length; i += PARALLEL_BATCH_SIZE) {
     const batch = toTry.slice(i, i + PARALLEL_BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (s) => {
         const raw = await fetchToonStreamServers(s, season, episode);
-        return { servers: buildToonStreamServers(raw) };
+        return { slug: s, servers: buildToonStreamServers(raw) };
       })
     );
     for (const r of results) {
-      if (r.servers.length > 0) return r.servers;
+      if (r.servers.length > best.servers.length) best = r;
     }
+    if (best.servers.length >= 7) break;
   }
 
-  // Phase 4: Progressive word-trim fallback
-  const longestTitle =
-    titleEnglish && titleEnglish.length > (titleRomaji || "").length
-      ? titleEnglish
-      : titleRomaji || titleEnglish;
+  // ============ Phase 4: Progressive word-trim (if best still weak) ============
+  if (best.servers.length < 4) {
+    const longestTitle =
+      titleEnglish && titleEnglish.length > (titleRomaji || "").length
+        ? titleEnglish
+        : titleRomaji || titleEnglish;
 
-  if (longestTitle) {
-    const normTitle = normalizeTitle(applyAlias(longestTitle));
-    const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
-    for (let i = words.length - 1; i >= 2; i--) {
-      const shortTitle = words.slice(0, i).join(" ");
-      if (searchQueries.includes(shortTitle)) continue;
-      if (similarityScore(longestTitle, shortTitle) < 60) continue;
+    if (longestTitle) {
+      const normTitle = normalizeTitle(applyAlias(longestTitle));
+      const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
+      for (let i = words.length - 1; i >= 2; i--) {
+        const shortTitle = words.slice(0, i).join(" ");
+        if (searchQueries.includes(shortTitle)) continue;
+        if (similarityScore(longestTitle, shortTitle) < 60) continue;
 
-      const slugs = await searchToonStreamSlugs(shortTitle);
-      for (const s of slugs) {
-        if (triedSet.has(s)) continue;
-        triedSet.add(s);
-        const raw = await fetchToonStreamServers(s, season, episode);
-        const built = buildToonStreamServers(raw);
-        if (built.length > 0) return built;
+        const slugs = await searchToonStreamSlugs(shortTitle);
+        for (const s of slugs) {
+          if (triedSet.has(s)) continue;
+          triedSet.add(s);
+          const raw = await fetchToonStreamServers(s, season, episode);
+          const built = buildToonStreamServers(raw);
+          if (built.length > best.servers.length) {
+            best = { slug: s, servers: built };
+          }
+        }
       }
     }
   }
 
-  return [];
+  return best.servers;
 }
 
 // ===================================================================
@@ -557,7 +607,7 @@ async function handleDebug(url) {
 
   return jsonResponse({
     success: true,
-    version: "7.0-industrial",
+    version: "8.0-industrial",
     input: { slug, titleRomaji, titleEnglish },
     generated_slug_candidates: slugCandidates,
     generated_search_queries: searchQueries,

@@ -1,13 +1,11 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v8.0 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v8.1 - FINAL)
 // ===================================================================
-// v8.0 Features:
-//   • Auto-slug discovery (Title-first priority)
-//   • Dub variant queries (hindi dub, muse dub, sony yay dub)
-//   • Search scoring BOOST for dub entries
-//   • Best-tracking (not first-found return)
-//   • 6-layer fallback chain
-//   • Debug endpoints
+// v8.1 FINAL FIX:
+//   • Phase 1 candidates limited to 5 (prevents scraper rate-limit)
+//   • Dub variants only in search queries (not direct slugs)
+//   • Best-tracking (not first-found) in all phases
+//   • Clean 6-layer fallback chain
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -38,6 +36,7 @@ const MIN_MATCH_SCORE = 55;
 const MAX_ANIKOTO_RESULTS = 3;
 const PARALLEL_BATCH_SIZE = 3;
 const FETCH_TIMEOUT_MS = 15000;
+const MAX_PHASE1_CANDIDATES = 5;
 
 const STOP_WORDS = new Set([
   "the", "a", "an", "of", "and", "to", "in", "on", "for",
@@ -76,11 +75,12 @@ export default {
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v8.0",
-      version: "8.0-industrial",
+      message: "Proxy API Worker v8.1",
+      version: "8.1-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
       min_match_score: MIN_MATCH_SCORE,
+      max_phase1_candidates: MAX_PHASE1_CANDIDATES,
       debug_endpoints: ["/api/debug", "/api/slug-test"],
     });
   },
@@ -238,12 +238,12 @@ function toSlug(s) {
 }
 
 // ===================================================================
-// SLUG CANDIDATES — TITLE-FIRST PRIORITY + DUB VARIANTS
+// SLUG CANDIDATES — v8.1 (LIMITED to 5 — no dub variants here)
 // ===================================================================
 function getSlugCandidates(slug, ...titles) {
   const candidates = new Set();
 
-  // TITLE-BASED SLUGS FIRST
+  // TITLE-BASED SLUGS FIRST (ToonStream uses display titles)
   for (const title of titles) {
     if (!title) continue;
     const aliasTitle = applyAlias(title);
@@ -253,17 +253,6 @@ function getSlugCandidates(slug, ...titles) {
     if (title) candidates.add(toSlug(title));
     if (normTitle) candidates.add(toSlug(normTitle));
     if (cleanTitle) candidates.add(toSlug(cleanTitle));
-
-    // NEW: Dub variant slugs
-    const dubSuffixes = ["hindi-dub", "muse-dub", "sony-yay-dub", "dub"];
-    for (const base of [normTitle, cleanTitle, aliasTitle]) {
-      if (!base || base.length < 3) continue;
-      const baseSlug = toSlug(base);
-      if (!baseSlug) continue;
-      for (const suffix of dubSuffixes) {
-        candidates.add(`${baseSlug}-${suffix}`);
-      }
-    }
   }
 
   // DB slug AFTER titles
@@ -271,9 +260,13 @@ function getSlugCandidates(slug, ...titles) {
   const normSlug = normalizeSlug(slug);
   if (normSlug && normSlug !== slug) candidates.add(normSlug);
 
-  return Array.from(candidates).filter((c) => c.length > 0);
+  // ⚡ Limit to top 5 candidates — prevents scraper rate-limit
+  return Array.from(candidates).filter((c) => c.length > 0).slice(0, MAX_PHASE1_CANDIDATES);
 }
 
+// ===================================================================
+// SEARCH QUERIES — includes dub variants for Phase 2
+// ===================================================================
 function getSearchQueriesForTitle(title) {
   const queries = new Set();
   if (!title) return [];
@@ -290,8 +283,8 @@ function getSearchQueriesForTitle(title) {
   if (words.length >= 5) queries.add(words.slice(0, 4).join(" "));
   if (words.length >= 4) queries.add(words.slice(0, 3).join(" "));
 
-  // Dub variant queries
-  const dubSuffixes = ["Hindi Dub", "Muse Dub", "Sony Yay Dub", "Dub", "Hindi"];
+  // ⚡ Dub variant queries — these find "hindi dub" entries
+  const dubSuffixes = ["Hindi Dub", "Muse Dub", "Sony Yay Dub", "Dub"];
   const baseTitles = [normTitle, cleanTitle, aliasTitle].filter(
     (t, i, arr) => t && t.length >= 3 && arr.indexOf(t) === i
   );
@@ -440,7 +433,6 @@ async function searchToonStreamSlugs(title) {
       else if (itemTitleLower.includes("dub")) score += 15;
       else if (itemTitleLower.includes("multi audio")) score += 15;
 
-      // Series bonus
       if (item.type === "series") score += 3;
 
       scored.push({ slug: match[1], title: itemTitle, score });
@@ -511,10 +503,10 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM MAIN — Best-tracking 6-layer fallback
+// TOONSTREAM MAIN — Best-tracking 4-phase fallback
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
-  // ============ Phase 1: Direct slug attempts (parallel) ============
+  // ============ Phase 1: Direct slug attempts (parallel, LIMITED to 5) ============
   const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
   const phase1 = await Promise.all(
     slugCandidates.map(async (candidate) => {
@@ -561,7 +553,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     if (best.servers.length >= 7) break;
   }
 
-  // ============ Phase 4: Progressive word-trim (if best still weak) ============
+  // ============ Phase 4: Progressive word-trim (only if best still weak) ============
   if (best.servers.length < 4) {
     const longestTitle =
       titleEnglish && titleEnglish.length > (titleRomaji || "").length
@@ -607,10 +599,10 @@ async function handleDebug(url) {
 
   return jsonResponse({
     success: true,
-    version: "8.0-industrial",
+    version: "8.1-industrial",
     input: { slug, titleRomaji, titleEnglish },
-    generated_slug_candidates: slugCandidates,
-    generated_search_queries: searchQueries,
+    phase1_candidates: slugCandidates,
+    phase2_search_queries: searchQueries,
   });
 }
 

@@ -866,3 +866,132 @@ async function handleRootTest(url) {
   const rootInfo = await findRootSeriesInfo(anilistId);
   return jsonResponse({ success: true, anilist_id: anilistId, root_series_info: rootInfo });
 }
+// ===================================================================
+// PROXY HANDLER
+// ===================================================================
+async function handleProxy(url) {
+  const targetUrl = url.searchParams.get("url");
+  if (!targetUrl) {
+    return jsonResponse({ success: false, error: "Missing 'url' parameter" }, 400);
+  }
+
+  try {
+    const targetURL = new URL(targetUrl);
+    const headers = new Headers();
+    headers.set("User-Agent", USER_AGENT);
+    headers.set(
+      "Accept",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    );
+    headers.set("Accept-Language", "en-US,en;q=0.9");
+    headers.set("Referer", targetURL.origin + "/");
+
+    const response = await fetch(targetUrl, { headers, redirect: "follow" });
+    const newHeaders = new Headers(response.headers);
+    newHeaders.delete("X-Frame-Options");
+    newHeaders.delete("Content-Security-Policy");
+    newHeaders.delete("Content-Security-Policy-Report-Only");
+    newHeaders.set("Access-Control-Allow-Origin", "*");
+
+    return new Response(response.body, {
+      status: response.status,
+      headers: newHeaders,
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, error: e.message }, 500);
+  }
+}
+
+// ===================================================================
+// MAIN STREAMING API HANDLER
+// ===================================================================
+async function handleStreamingAPI(url) {
+  const params = url.searchParams;
+  const anilistId = params.get("anilist_id");
+  const slug = params.get("slug") || "";
+  const titleEnglish = params.get("title_english") || params.get("title") || "";
+  const titleRomaji = params.get("title_romaji") || "";
+  const season = parseInt(params.get("season") || "1");
+  const episode = parseInt(params.get("episode") || "1");
+
+  if (!slug && !titleEnglish && !titleRomaji) {
+    return jsonResponse(
+      { success: false, error: "Need at least 'slug' or 'title'" },
+      400
+    );
+  }
+
+  const anikotoTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const anikotoTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
+  const toonTitleRomaji = titleRomaji || titleEnglish || slug.replace(/-/g, " ");
+  const toonTitleEnglish = titleEnglish || titleRomaji || slug.replace(/-/g, " ");
+
+  // Fetch AniList meta + root info (cached)
+  let anilistMeta = null;
+  let rootInfo = null;
+  if (anilistId && parseInt(anilistId) > 0) {
+    const media = await fetchAniListMedia(anilistId);
+    if (media) {
+      const format = (media.format || "").toUpperCase();
+      if (format === "TV" || format === "MOVIE") {
+        anilistMeta = {
+          format,
+          year: media.startDate?.year || media.seasonYear || null,
+        };
+        // Only walk prequels for TV
+        if (format === "TV") {
+          rootInfo = await findRootSeriesInfo(anilistId);
+        }
+      }
+    }
+  }
+
+  const [anikotoServers, toonstreamServers] = await Promise.all([
+    getAnikotoLinks(anikotoTitleRomaji, anikotoTitleEnglish, episode),
+    slug
+      ? getToonStreamLinks(
+          slug,
+          season,
+          episode,
+          toonTitleRomaji,
+          toonTitleEnglish,
+          anilistMeta,
+          rootInfo
+        )
+      : Promise.resolve([]),
+  ]);
+
+  const subServers = anikotoServers.filter((s) => s.type === "sub");
+  const dubServers = [
+    ...anikotoServers.filter((s) => s.type === "dub"),
+    ...toonstreamServers,
+  ];
+
+  const allServers = [...anikotoServers, ...toonstreamServers];
+
+  return jsonResponse({
+    success: allServers.length > 0,
+    data: {
+      anilist_id: anilistId,
+      slug: slug,
+      title_english: titleEnglish,
+      title_romaji: titleRomaji,
+      season: season,
+      episode: episode,
+      anilist_format: anilistMeta?.format || null,
+      release_year: anilistMeta?.year || null,
+      root_series: rootInfo
+        ? {
+            detected: true,
+            root_title_english: rootInfo.rootTitleEnglish,
+            root_title_romaji: rootInfo.rootTitleRomaji,
+            seasons_before: rootInfo.seasonsBefore,
+          }
+        : { detected: false },
+      total_servers: allServers.length,
+      sub_count: subServers.length,
+      dub_count: dubServers.length,
+      servers: allServers,
+    },
+  });
+}

@@ -1,12 +1,14 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v9.0 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v10.0 - FINAL)
 // ===================================================================
-// v9.0 Features:
-//   • Uses Deno AniList proxy (no direct AniList call)
-//   • Fetches format + year via proxy
-//   • Only TV & MOVIE formats get year suffix
-//   • Year suffix added to slug candidates
-//   • All previous v8.1 fixes retained
+// v10.0 NEW ARCHITECTURE:
+//   • PHASE 1: SEARCH-FIRST (ToonStream exact slug from Search API)
+//   • Content type filter: AniList TV → series, MOVIE → movie
+//   • Year variants auto-added (vinland-saga + vinland-saga-2019)
+//   • Rate-limit safe: batch=2 parallel max
+//   • PHASE 2: Guess-based fallback (if search returns nothing)
+//   • PHASE 3: Progressive word-trim (last resort)
+//   • All v9.0 features retained
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -36,9 +38,9 @@ const USER_AGENT =
 
 const MIN_MATCH_SCORE = 55;
 const MAX_ANIKOTO_RESULTS = 3;
-const PARALLEL_BATCH_SIZE = 3;
+const PARALLEL_BATCH_SIZE = 2;       // ⚡ Rate-limit safe
+const SCRAPER_FETCH_TIMEOUT_MS = 20000;  // ⚡ Give scraper time to respond
 const FETCH_TIMEOUT_MS = 15000;
-const MAX_PHASE1_CANDIDATES = 5;
 
 const STOP_WORDS = new Set([
   "the", "a", "an", "of", "and", "to", "in", "on", "for",
@@ -74,16 +76,16 @@ export default {
     if (path === "/api/streaming" || path === "/api") return handleStreamingAPI(url);
     if (path === "/api/debug") return handleDebug(url);
     if (path === "/api/slug-test") return handleSlugTest(url);
+    if (path === "/api/search-test") return handleSearchTest(url);
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v9.0",
-      version: "9.0-industrial",
+      message: "Proxy API Worker v10.0",
+      version: "10.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
-      min_match_score: MIN_MATCH_SCORE,
-      max_phase1_candidates: MAX_PHASE1_CANDIDATES,
-      debug_endpoints: ["/api/debug", "/api/slug-test"],
+      architecture: "search-first",
+      debug_endpoints: ["/api/debug", "/api/slug-test", "/api/search-test"],
     });
   },
 };
@@ -141,30 +143,23 @@ function similarityScore(a, b) {
   const s1 = a.toLowerCase().trim();
   const s2 = b.toLowerCase().trim();
   if (s1 === s2) return 100;
-
   const maxLen = Math.max(s1.length, s2.length);
   const distance = levenshtein(s1, s2);
   const levScore = ((maxLen - distance) / maxLen) * 100;
-
   const set1 = new Set(s1.split(/\s+/).filter((t) => t.length > 0));
   const set2 = new Set(s2.split(/\s+/).filter((t) => t.length > 0));
   const intersection = [...set1].filter((t) => set2.has(t)).length;
   const union = new Set([...set1, ...set2]).size;
   const tokenScore = union > 0 ? (intersection / union) * 100 : 0;
-
   let bonus = 0;
   if (s1.includes(s2) || s2.includes(s1)) bonus = 15;
-
   return Math.min(100, Math.round(levScore * 0.5 + tokenScore * 0.5 + bonus));
 }
 
 function removeStopWords(title) {
-  return title
-    .toLowerCase()
-    .split(/\s+/)
+  return title.toLowerCase().split(/\s+/)
     .filter((w) => w.length > 0 && !STOP_WORDS.has(w))
-    .join(" ")
-    .trim();
+    .join(" ").trim();
 }
 
 function applyAlias(title) {
@@ -175,27 +170,16 @@ function applyAlias(title) {
 function normalizeSlug(slug) {
   let s = slug.toLowerCase().trim();
   const patterns = [
-    /-(\d+)(st|nd|rd|th)-season$/,
-    /-season-\d+$/,
-    /-the-final-season$/,
-    /-final-season-part-\d+$/,
-    /-final-season$/,
-    /-part-\d+$/,
-    /-cour-\d+$/,
-    /-\d+nd-season$/,
-    /-\d+rd-season$/,
-    /-\d+th-season$/,
-    /-season$/,
+    /-(\d+)(st|nd|rd|th)-season$/, /-season-\d+$/, /-the-final-season$/,
+    /-final-season-part-\d+$/, /-final-season$/, /-part-\d+$/, /-cour-\d+$/,
+    /-\d+nd-season$/, /-\d+rd-season$/, /-\d+th-season$/, /-season$/,
   ];
   let changed = true;
   while (changed) {
     changed = false;
     for (const p of patterns) {
       const next = s.replace(p, "");
-      if (next !== s) {
-        s = next;
-        changed = true;
-      }
+      if (next !== s) { s = next; changed = true; }
     }
   }
   return s;
@@ -204,25 +188,17 @@ function normalizeSlug(slug) {
 function normalizeTitle(title) {
   let t = title.trim();
   const patterns = [
-    /\s+\d+(st|nd|rd|th)\s+Season$/i,
-    /\s+Season\s+\d+\s+Part\s+\d+$/i,
-    /\s+Season\s+\d+$/i,
-    /\s+The\s+Final\s+Season$/i,
-    /\s+Final\s+Season\s+Part\s+\d+$/i,
-    /\s+Final\s+Season$/i,
-    /\s+Part\s+\d+$/i,
-    /\s+Cour\s+\d+$/i,
-    /\s+Season$/i,
+    /\s+\d+(st|nd|rd|th)\s+Season$/i, /\s+Season\s+\d+\s+Part\s+\d+$/i,
+    /\s+Season\s+\d+$/i, /\s+The\s+Final\s+Season$/i,
+    /\s+Final\s+Season\s+Part\s+\d+$/i, /\s+Final\s+Season$/i,
+    /\s+Part\s+\d+$/i, /\s+Cour\s+\d+$/i, /\s+Season$/i,
   ];
   let changed = true;
   while (changed) {
     changed = false;
     for (const p of patterns) {
       const next = t.replace(p, "");
-      if (next !== t) {
-        t = next;
-        changed = true;
-      }
+      if (next !== t) { t = next; changed = true; }
     }
   }
   return t.trim();
@@ -230,17 +206,40 @@ function normalizeTitle(title) {
 
 function toSlug(s) {
   if (!s) return "";
-  return s
-    .toLowerCase()
-    .normalize("NFKD")
+  return s.toLowerCase().normalize("NFKD")
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 }
 
+function extractSlugFromUrl(url) {
+  if (!url) return null;
+  const m = url.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
+  return m && m[1] ? m[1] : null;
+}
+
+function extractYearFromTitle(title) {
+  if (!title) return null;
+  const m = title.match(/\((\d{4})\)/);
+  return m ? parseInt(m[1]) : null;
+}
+
+function dedupeArray(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    if (!item) continue;
+    const s = String(item).trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 // ===================================================================
-// ANILIST PROXY CALL — fetch format + year
+// ANILIST PROXY — fetch format + year
 // ===================================================================
 async function fetchAniListMeta(anilistId) {
   if (!anilistId || parseInt(anilistId) <= 0) return null;
@@ -262,10 +261,8 @@ async function fetchAniListMeta(anilistId) {
     const json = await res.json();
     const media = json?.data?.Media;
     if (!media) return null;
-
     const format = (media.format || "").toUpperCase();
     if (format !== "TV" && format !== "MOVIE") return null;
-
     const year = media.startDate?.year || media.seasonYear || null;
     return { format, year };
   } catch (e) {
@@ -274,95 +271,275 @@ async function fetchAniListMeta(anilistId) {
 }
 
 // ===================================================================
-// SLUG CANDIDATES — with year variants (TV/MOVIE only)
+// TOONSTREAM SEARCH — returns array of { slug, title, type, year }
 // ===================================================================
-function getSlugCandidates(slug, ...args) {
-  const candidates = new Set();
-  const year = args.pop();
-  const titles = args;
+async function searchToonStreamResults(title) {
+  if (!title) return [];
+  try {
+    const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
+    const res = await fetch(searchUrl, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/json, text/plain, */*",
+        Referer: `${TOONSTREAM_SITE}/`,
+      },
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (!Array.isArray(json.data) || json.data.length === 0) return [];
 
-  const addYearVariants = (baseSlug) => {
-    if (!baseSlug || !year) return;
-    candidates.add(`${baseSlug}-${year}`);
+    const results = [];
+    for (const item of json.data) {
+      const slug = extractSlugFromUrl(item.url);
+      if (!slug) continue;
+      results.push({
+        slug,
+        title: (item.title || "").trim(),
+        type: (item.type || "").trim().toLowerCase(),
+        year: extractYearFromTitle(item.title),
+      });
+    }
+    return results;
+  } catch (e) {
+    return [];
+  }
+}
+// ===================================================================
+// TOONSTREAM HELPERS
+// ===================================================================
+function getToonStreamServerName(url) {
+  if (url.includes("voe.sx")) return "VOE";
+  if (url.includes("vidara.to")) return "Vidara";
+  if (url.includes("vidc.upns.pro")) return "Vidc";
+  if (url.includes("abyssplayer.com")) return "Abyss";
+  if (url.includes("filesforever.link")) return "FilesForever";
+  if (url.includes("ravok.buzz")) return "Ravok";
+  if (url.includes("cloudy.upns.one")) return "Cloudy";
+  if (url.includes("vidmoly.net")) return "Vidmoly";
+  return "Unknown";
+}
+
+async function fetchToonStreamServers(slug, season, episode) {
+  try {
+    const apiUrl = `${TOONSTREAM_API}/api/streaming?slug=${encodeURIComponent(slug)}&season=${season}&episode=${episode}`;
+    const data = await fetchJSON(apiUrl, {}, SCRAPER_FETCH_TIMEOUT_MS);
+    if (data?.success && data.data?.servers?.length > 0) {
+      return data.data.servers;
+    }
+  } catch (e) {}
+  return [];
+}
+
+function buildToonStreamServers(rawServers) {
+  const workingUrls = [];
+  const seenUrls = new Set();
+
+  for (const server of rawServers) {
+    const originalUrl = server.embed_url;
+    if (!originalUrl) continue;
+    if (seenUrls.has(originalUrl)) continue;
+    const isWorking = WORKING_TOONSTREAM_SERVERS.some((domain) =>
+      originalUrl.includes(domain)
+    );
+    if (!isWorking) continue;
+    seenUrls.add(originalUrl);
+    workingUrls.push(originalUrl);
+  }
+
+  if (workingUrls.length === 0) return [];
+
+  const domainCounts = {};
+  for (const url of workingUrls) {
+    const baseName = getToonStreamServerName(url);
+    domainCounts[baseName] = (domainCounts[baseName] || 0) + 1;
+  }
+
+  const domainIndexes = {};
+  const servers = [];
+  for (const originalUrl of workingUrls) {
+    const baseName = getToonStreamServerName(originalUrl);
+    let finalName = baseName;
+    if (domainCounts[baseName] > 1) {
+      domainIndexes[baseName] = (domainIndexes[baseName] || 0) + 1;
+      finalName = `${baseName} ${domainIndexes[baseName]}`;
+    }
+    servers.push({
+      server_name: `ToonStream - ${finalName}`,
+      source: "toonstream",
+      type: "dub",
+      language: "multi-audio",
+      embed_url: originalUrl,
+      ready_to_use: true,
+    });
+  }
+  return servers;
+}
+
+// ===================================================================
+// HELPER: Try slugs in rate-limit-safe batches, return best
+// ===================================================================
+async function trySlugsInBatches(slugList, season, episode, bestSoFar, targetCount) {
+  let best = bestSoFar || { slug: null, servers: [] };
+  for (let i = 0; i < slugList.length; i += PARALLEL_BATCH_SIZE) {
+    const batch = slugList.slice(i, i + PARALLEL_BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (s) => {
+        const raw = await fetchToonStreamServers(s, season, episode);
+        return { slug: s, servers: buildToonStreamServers(raw) };
+      })
+    );
+    for (const r of results) {
+      if (r.servers.length > best.servers.length) best = r;
+    }
+    if (best.servers.length >= targetCount) break;
+  }
+  return best;
+}
+
+// ===================================================================
+// TOONSTREAM MAIN — v10.0 SEARCH-FIRST ARCHITECTURE
+// ===================================================================
+async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish, anilistMeta) {
+  const isMovieRequest = anilistMeta?.format === "MOVIE";
+  const year = anilistMeta?.year || null;
+
+  // ============================================================
+  // PHASE 1: SEARCH-FIRST (ToonStream exact slugs from Search API)
+  // ============================================================
+  const searchTitles = dedupeArray([
+    titleEnglish,
+    titleRomaji,
+    slug ? slug.replace(/-/g, " ") : null,
+  ]);
+
+  const allSearchResults = [];
+  const seenSlugs = new Set();
+
+  for (const title of searchTitles) {
+    const results = await searchToonStreamResults(title);
+    for (const r of results) {
+      if (seenSlugs.has(r.slug)) continue;
+      seenSlugs.add(r.slug);
+      allSearchResults.push(r);
+    }
+    if (allSearchResults.length >= 6) break;
+  }
+
+  // Filter by content type: TV→series, MOVIE→movie
+  const filteredByType = allSearchResults.filter((r) => {
+    if (isMovieRequest) return r.type === "movie";
+    return r.type === "series";
+  });
+
+  // Build slug list with year variants (priority: exact match first)
+  const searchSlugs = [];
+  const searchAdded = new Set();
+  const pushSearchSlug = (s) => {
+    if (!s || searchAdded.has(s)) return;
+    searchAdded.add(s);
+    searchSlugs.push(s);
   };
 
-  for (const title of titles) {
-    if (!title) continue;
-    const aliasTitle = applyAlias(title);
-    const normTitle = normalizeTitle(aliasTitle);
-    const cleanTitle = removeStopWords(normTitle);
+  for (const r of filteredByType) {
+    pushSearchSlug(r.slug);
+    if (r.year) pushSearchSlug(`${r.slug}-${r.year}`);
+    if (year && year !== r.year) pushSearchSlug(`${r.slug}-${year}`);
+  }
 
-    if (title) {
-      const s = toSlug(title);
-      candidates.add(s);
-      addYearVariants(s);
+  let best = { slug: null, servers: [] };
+  if (searchSlugs.length > 0) {
+    best = await trySlugsInBatches(searchSlugs, season, episode, best, 5);
+    // If found enough, return immediately
+    if (best.servers.length >= 5) return best.servers;
+  }
+
+  // ============================================================
+  // PHASE 2: GUESS-BASED FALLBACK (only if search missed)
+  // ============================================================
+  if (best.servers.length < 3) {
+    const guessSlugs = [];
+    const guessAdded = new Set();
+    const pushGuessSlug = (s) => {
+      if (!s || guessAdded.has(s) || searchAdded.has(s)) return;
+      guessAdded.add(s);
+      guessSlugs.push(s);
+    };
+
+    for (const t of [titleEnglish, titleRomaji]) {
+      if (!t) continue;
+      const aliasT = applyAlias(t);
+      const normT = normalizeTitle(aliasT);
+      const cleanT = removeStopWords(normT);
+
+      const s1 = toSlug(t);
+      const s2 = toSlug(normT);
+      const s3 = toSlug(cleanT);
+
+      pushGuessSlug(s1);
+      pushGuessSlug(s2);
+      pushGuessSlug(s3);
+
+      if (year) {
+        pushGuessSlug(`${s1}-${year}`);
+        pushGuessSlug(`${s2}-${year}`);
+        pushGuessSlug(`${s3}-${year}`);
+      }
     }
-    if (normTitle) {
-      const s = toSlug(normTitle);
-      candidates.add(s);
-      addYearVariants(s);
+
+    if (slug) {
+      pushGuessSlug(slug);
+      const normSlug = normalizeSlug(slug);
+      if (normSlug !== slug) pushGuessSlug(normSlug);
+      if (year) {
+        pushGuessSlug(`${slug}-${year}`);
+        if (normSlug !== slug) pushGuessSlug(`${normSlug}-${year}`);
+      }
     }
-    if (cleanTitle) {
-      const s = toSlug(cleanTitle);
-      candidates.add(s);
-      addYearVariants(s);
+
+    if (guessSlugs.length > 0) {
+      best = await trySlugsInBatches(guessSlugs, season, episode, best, 5);
     }
   }
 
-  if (slug) {
-    candidates.add(slug);
-    addYearVariants(slug);
-  }
-  const normSlug = normalizeSlug(slug);
-  if (normSlug && normSlug !== slug) {
-    candidates.add(normSlug);
-    addYearVariants(normSlug);
+  // ============================================================
+  // PHASE 3: PROGRESSIVE WORD-TRIM (last resort)
+  // ============================================================
+  if (best.servers.length < 3) {
+    const longestTitle =
+      titleEnglish && titleEnglish.length > (titleRomaji || "").length
+        ? titleEnglish
+        : titleRomaji || titleEnglish;
+
+    if (longestTitle) {
+      const normTitle = normalizeTitle(applyAlias(longestTitle));
+      const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
+
+      for (let i = words.length - 1; i >= 2; i--) {
+        const shortTitle = words.slice(0, i).join(" ");
+        if (similarityScore(longestTitle, shortTitle) < 60) continue;
+
+        const results = await searchToonStreamResults(shortTitle);
+        const filtered = results.filter((r) => {
+          if (isMovieRequest) return r.type === "movie";
+          return r.type === "series";
+        });
+
+        for (const r of filtered) {
+          if (searchAdded.has(r.slug) || guessAdded.has(r.slug)) continue;
+          const raw = await fetchToonStreamServers(r.slug, season, episode);
+          const built = buildToonStreamServers(raw);
+          if (built.length > best.servers.length) {
+            best = { slug: r.slug, servers: built };
+          }
+        }
+        if (best.servers.length >= 5) break;
+      }
+    }
   }
 
-  return Array.from(candidates).filter((c) => c.length > 0).slice(0, MAX_PHASE1_CANDIDATES);
+  return best.servers;
 }
 
-// ===================================================================
-// SEARCH QUERIES — with dub variants
-// ===================================================================
-function getSearchQueriesForTitle(title) {
-  const queries = new Set();
-  if (!title) return [];
-  const aliasTitle = applyAlias(title);
-  const normTitle = normalizeTitle(aliasTitle);
-  const cleanTitle = removeStopWords(normTitle);
-
-  if (title.trim()) queries.add(title.trim());
-  if (aliasTitle && aliasTitle !== title) queries.add(aliasTitle);
-  if (normTitle && normTitle !== title) queries.add(normTitle);
-  if (cleanTitle && cleanTitle !== title && cleanTitle !== normTitle) queries.add(cleanTitle);
-
-  const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
-  if (words.length >= 5) queries.add(words.slice(0, 4).join(" "));
-  if (words.length >= 4) queries.add(words.slice(0, 3).join(" "));
-
-  // Dub variant queries
-  const dubSuffixes = ["Hindi Dub", "Muse Dub", "Sony Yay Dub", "Dub"];
-  const baseTitles = [normTitle, cleanTitle, aliasTitle].filter(
-    (t, i, arr) => t && t.length >= 3 && arr.indexOf(t) === i
-  );
-  for (const base of baseTitles) {
-    for (const suffix of dubSuffixes) {
-      queries.add(`${base} ${suffix}`);
-    }
-  }
-
-  return Array.from(queries).filter((q) => q.length >= 3);
-}
-
-function getAllSearchQueries(...titles) {
-  const all = new Set();
-  for (const title of titles) {
-    if (!title) continue;
-    getSearchQueriesForTitle(title).forEach((q) => all.add(q));
-  }
-  return Array.from(all);
-}
 // ===================================================================
 // ANIKOTO — Multi-Result Fallback
 // ===================================================================
@@ -425,222 +602,6 @@ async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
 }
 
 // ===================================================================
-// TOONSTREAM HELPERS
-// ===================================================================
-function getToonStreamServerName(url) {
-  if (url.includes("voe.sx")) return "VOE";
-  if (url.includes("vidara.to")) return "Vidara";
-  if (url.includes("vidc.upns.pro")) return "Vidc";
-  if (url.includes("abyssplayer.com")) return "Abyss";
-  if (url.includes("filesforever.link")) return "FilesForever";
-  if (url.includes("ravok.buzz")) return "Ravok";
-  if (url.includes("cloudy.upns.one")) return "Cloudy";
-  if (url.includes("vidmoly.net")) return "Vidmoly";
-  return "Unknown";
-}
-
-async function fetchToonStreamServers(slug, season, episode) {
-  try {
-    const apiUrl = `${TOONSTREAM_API}/api/streaming?slug=${encodeURIComponent(slug)}&season=${season}&episode=${episode}`;
-    const data = await fetchJSON(apiUrl, {}, 12000);
-    if (data?.success && data.data?.servers?.length > 0) {
-      return data.data.servers;
-    }
-  } catch (e) {}
-  return [];
-}
-
-// ===================================================================
-// SEARCH TOONSTREAM — with DUB entry BOOST
-// ===================================================================
-async function searchToonStreamSlugs(title) {
-  try {
-    const searchUrl = `${TOONSTREAM_SITE}/search/all?q=${encodeURIComponent(title)}`;
-    const res = await fetch(searchUrl, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "application/json, text/plain, */*",
-        Referer: `${TOONSTREAM_SITE}/`,
-      },
-    });
-    if (!res.ok) return [];
-
-    const json = await res.json();
-    if (!Array.isArray(json.data) || json.data.length === 0) return [];
-
-    const titleClean = removeStopWords(normalizeTitle(title));
-    const scored = [];
-
-    for (const item of json.data) {
-      const itemUrl = item.url || "";
-      const itemTitle = (item.title || "").trim();
-      const itemTitleLower = itemTitle.toLowerCase();
-      const match = itemUrl.match(/\/(?:series|movies|episode)\/([^\/\?]+)/);
-      if (!match || !match[1]) continue;
-
-      const itemTitleClean = removeStopWords(itemTitle);
-      const score1 = similarityScore(title, itemTitle);
-      const score2 = similarityScore(titleClean, itemTitleClean);
-      let score = Math.max(score1, score2);
-
-      if (itemTitleLower.includes("hindi dub")) score += 25;
-      else if (itemTitleLower.includes("hindi")) score += 20;
-      else if (itemTitleLower.includes("muse dub")) score += 22;
-      else if (itemTitleLower.includes("sony yay dub")) score += 22;
-      else if (itemTitleLower.includes("dub")) score += 15;
-      else if (itemTitleLower.includes("multi audio")) score += 15;
-
-      if (item.type === "series") score += 3;
-
-      scored.push({ slug: match[1], title: itemTitle, score });
-    }
-
-    const filtered = scored.filter((s) => s.score >= MIN_MATCH_SCORE);
-    filtered.sort((a, b) => b.score - a.score);
-
-    const seen = new Set();
-    const unique = [];
-    for (const item of filtered) {
-      if (!seen.has(item.slug)) {
-        seen.add(item.slug);
-        unique.push(item.slug);
-      }
-    }
-    return unique;
-  } catch (e) {
-    return [];
-  }
-}
-
-function buildToonStreamServers(rawServers) {
-  const workingUrls = [];
-  const seenUrls = new Set();
-
-  for (const server of rawServers) {
-    const originalUrl = server.embed_url;
-    if (!originalUrl) continue;
-    if (seenUrls.has(originalUrl)) continue;
-
-    const isWorking = WORKING_TOONSTREAM_SERVERS.some((domain) =>
-      originalUrl.includes(domain)
-    );
-    if (!isWorking) continue;
-
-    seenUrls.add(originalUrl);
-    workingUrls.push(originalUrl);
-  }
-
-  if (workingUrls.length === 0) return [];
-
-  const domainCounts = {};
-  for (const url of workingUrls) {
-    const baseName = getToonStreamServerName(url);
-    domainCounts[baseName] = (domainCounts[baseName] || 0) + 1;
-  }
-
-  const domainIndexes = {};
-  const servers = [];
-  for (const originalUrl of workingUrls) {
-    const baseName = getToonStreamServerName(originalUrl);
-    let finalName = baseName;
-    if (domainCounts[baseName] > 1) {
-      domainIndexes[baseName] = (domainIndexes[baseName] || 0) + 1;
-      finalName = `${baseName} ${domainIndexes[baseName]}`;
-    }
-    servers.push({
-      server_name: `ToonStream - ${finalName}`,
-      source: "toonstream",
-      type: "dub",
-      language: "multi-audio",
-      embed_url: originalUrl,
-      ready_to_use: true,
-    });
-  }
-  return servers;
-}
-
-// ===================================================================
-// TOONSTREAM MAIN — Best-tracking 4-phase fallback (with year)
-// ===================================================================
-async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish, year) {
-  // ============ Phase 1: Direct slug attempts (with year variants) ============
-  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish, year);
-  const phase1 = await Promise.all(
-    slugCandidates.map(async (candidate) => {
-      const raw = await fetchToonStreamServers(candidate, season, episode);
-      return { slug: candidate, servers: buildToonStreamServers(raw) };
-    })
-  );
-
-  let best = { slug: null, servers: [] };
-  for (const r of phase1) {
-    if (r.servers.length > best.servers.length) best = r;
-  }
-
-  if (best.servers.length >= 5) return best.servers;
-
-  // ============ Phase 2: Search with BOTH titles + dub variants ============
-  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
-  const phase2SearchResults = await Promise.all(
-    searchQueries.map((q) => searchToonStreamSlugs(q))
-  );
-
-  const allSearchSlugs = new Set();
-  for (const slugs of phase2SearchResults) {
-    for (const s of slugs) allSearchSlugs.add(s);
-  }
-
-  const triedSet = new Set(slugCandidates);
-  const toTry = [...allSearchSlugs].filter((s) => !triedSet.has(s));
-
-  // ============ Phase 3: Batched parallel — track BEST ============
-  for (let i = 0; i < toTry.length; i += PARALLEL_BATCH_SIZE) {
-    const batch = toTry.slice(i, i + PARALLEL_BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map(async (s) => {
-        const raw = await fetchToonStreamServers(s, season, episode);
-        return { slug: s, servers: buildToonStreamServers(raw) };
-      })
-    );
-    for (const r of results) {
-      if (r.servers.length > best.servers.length) best = r;
-    }
-    if (best.servers.length >= 7) break;
-  }
-
-  // ============ Phase 4: Progressive word-trim (if best still weak) ============
-  if (best.servers.length < 4) {
-    const longestTitle =
-      titleEnglish && titleEnglish.length > (titleRomaji || "").length
-        ? titleEnglish
-        : titleRomaji || titleEnglish;
-
-    if (longestTitle) {
-      const normTitle = normalizeTitle(applyAlias(longestTitle));
-      const words = normTitle.split(/\s+/).filter((w) => w.length > 0);
-      for (let i = words.length - 1; i >= 2; i--) {
-        const shortTitle = words.slice(0, i).join(" ");
-        if (searchQueries.includes(shortTitle)) continue;
-        if (similarityScore(longestTitle, shortTitle) < 60) continue;
-
-        const slugs = await searchToonStreamSlugs(shortTitle);
-        for (const s of slugs) {
-          if (triedSet.has(s)) continue;
-          triedSet.add(s);
-          const raw = await fetchToonStreamServers(s, season, episode);
-          const built = buildToonStreamServers(raw);
-          if (built.length > best.servers.length) {
-            best = { slug: s, servers: built };
-          }
-        }
-      }
-    }
-  }
-
-  return best.servers;
-}
-
-// ===================================================================
 // DEBUG ENDPOINTS
 // ===================================================================
 async function handleDebug(url) {
@@ -651,21 +612,26 @@ async function handleDebug(url) {
   const anilistId = params.get("anilist_id") || "";
 
   let meta = null;
-  if (anilistId) {
-    meta = await fetchAniListMeta(anilistId);
-  }
+  if (anilistId) meta = await fetchAniListMeta(anilistId);
 
-  const year = meta?.year || null;
-  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish, year);
-  const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
+  const searchResults = [];
+  const seen = new Set();
+  for (const t of dedupeArray([titleEnglish, titleRomaji])) {
+    const results = await searchToonStreamResults(t);
+    for (const r of results) {
+      if (seen.has(r.slug)) continue;
+      seen.add(r.slug);
+      searchResults.push(r);
+    }
+  }
 
   return jsonResponse({
     success: true,
-    version: "9.0-industrial",
+    version: "10.0-industrial",
     input: { slug, titleRomaji, titleEnglish, anilistId },
     anilist_meta: meta,
-    phase1_candidates: slugCandidates,
-    phase2_search_queries: searchQueries,
+    toonstream_search_results: searchResults,
+    architecture: "search-first",
   });
 }
 
@@ -694,6 +660,21 @@ async function handleSlugTest(url) {
       name: b.server_name,
       url: b.embed_url,
     })),
+  });
+}
+
+async function handleSearchTest(url) {
+  const params = url.searchParams;
+  const title = params.get("title") || "";
+  if (!title) {
+    return jsonResponse({ success: false, error: "Missing title" }, 400);
+  }
+  const results = await searchToonStreamResults(title);
+  return jsonResponse({
+    success: true,
+    title,
+    count: results.length,
+    results,
   });
 }
 
@@ -762,15 +743,9 @@ async function handleStreamingAPI(url) {
   const toonTitleEnglish =
     titleEnglish || titleRomaji || slug.replace(/-/g, " ");
 
-  // Fetch AniList meta (year) via proxy — only if anilistId present
-  let releaseYear = null;
-  let anilistFormat = null;
+  let anilistMeta = null;
   if (anilistId && parseInt(anilistId) > 0) {
-    const meta = await fetchAniListMeta(anilistId);
-    if (meta) {
-      releaseYear = meta.year;
-      anilistFormat = meta.format;
-    }
+    anilistMeta = await fetchAniListMeta(anilistId);
   }
 
   const [anikotoServers, toonstreamServers] = await Promise.all([
@@ -782,7 +757,7 @@ async function handleStreamingAPI(url) {
           episode,
           toonTitleRomaji,
           toonTitleEnglish,
-          releaseYear
+          anilistMeta
         )
       : Promise.resolve([]),
   ]);
@@ -804,8 +779,8 @@ async function handleStreamingAPI(url) {
       title_romaji: titleRomaji,
       season: season,
       episode: episode,
-      anilist_format: anilistFormat,
-      release_year: releaseYear,
+      anilist_format: anilistMeta?.format || null,
+      release_year: anilistMeta?.year || null,
       total_servers: allServers.length,
       sub_count: subServers.length,
       dub_count: dubServers.length,

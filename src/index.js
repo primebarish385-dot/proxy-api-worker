@@ -1,8 +1,9 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v11.1 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v12.0 - FINAL)
 // ===================================================================
-// v11.1 FIX:
-//   • handleProxy: HTML URL rewrite (relative → absolute)
+// v12.0 CLEAN:
+//   • Removed HTML URL rewrite from handleProxy (not needed)
+//   • Simple passthrough proxy
 //   • All v11.0 features retained (arc-aware, search-first)
 // ===================================================================
 
@@ -74,10 +75,15 @@ export default {
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v11.1",
-      version: "11.1-industrial",
+      message: "Proxy API Worker v12.0",
+      version: "12.0-industrial",
       architecture: "arc-aware-search-first",
-      debug_endpoints: ["/api/debug", "/api/slug-test", "/api/search-test", "/api/root-test"],
+      debug_endpoints: [
+        "/api/debug",
+        "/api/slug-test",
+        "/api/search-test",
+        "/api/root-test",
+      ],
     });
   },
 };
@@ -335,7 +341,7 @@ async function findRootSeriesInfo(anilistId, depth = 0, visited = new Set()) {
   };
 }
 // ===================================================================
-// TOONSTREAM SEARCH — returns { slug, title, type, year }
+// TOONSTREAM SEARCH — returns array of { slug, title, type, year }
 // ===================================================================
 async function searchToonStreamResults(title) {
   if (!title) return [];
@@ -462,7 +468,7 @@ async function trySlugJobs(jobs, bestSoFar, targetCount) {
 }
 
 // ===================================================================
-// PHASE 1 — SEARCH-FIRST (v10.0 IDENTICAL)
+// PHASE 1 — SEARCH-FIRST (v10.0/v11.0 IDENTICAL)
 // ===================================================================
 async function phase1SearchFirst(titleEnglish, titleRomaji, slug, season, episode, isMovieRequest, year) {
   const searchTitles = dedupeArray([
@@ -658,15 +664,13 @@ async function phase3WordTrim(titleEnglish, titleRomaji, season, episode, isMovi
 }
 
 // ===================================================================
-// TOONSTREAM MAIN — Arc-Aware Search-First (v11.1)
+// TOONSTREAM MAIN — Arc-Aware Search-First
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish, anilistMeta, rootInfo) {
   const isMovieRequest = anilistMeta?.format === "MOVIE";
   const year = anilistMeta?.year || null;
 
-  // ============================================================
-  // PHASE 1: SEARCH-FIRST (v10.0 IDENTICAL)
-  // ============================================================
+  // ============ PHASE 1: SEARCH-FIRST ============
   const p1 = await phase1SearchFirst(
     titleEnglish, titleRomaji, slug, season, episode, isMovieRequest, year
   );
@@ -675,9 +679,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
 
   if (best.servers.length >= 5) return best.servers;
 
-  // ============================================================
-  // PHASE 1b: ARC-AWARE (only if arc detected)
-  // ============================================================
+  // ============ PHASE 1b: ARC-AWARE ============
   if (best.servers.length < 5 && rootInfo && (rootInfo.seasonsBefore || 0) > 0) {
     const p1b = await phase1bArcAware(
       rootInfo, season, episode, isMovieRequest, year, addedSlugs
@@ -686,9 +688,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     if (best.servers.length >= 5) return best.servers;
   }
 
-  // ============================================================
-  // PHASE 2: GUESS-BASED FALLBACK (only if best < 3)
-  // ============================================================
+  // ============ PHASE 2: GUESS-BASED FALLBACK ============
   if (best.servers.length < 3) {
     const p2 = await phase2GuessFallback(
       titleEnglish, titleRomaji, slug, season, episode, year, addedSlugs
@@ -697,9 +697,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     if (best.servers.length >= 5) return best.servers;
   }
 
-  // ============================================================
-  // PHASE 3: WORD-TRIM FALLBACK (only if best < 3)
-  // ============================================================
+  // ============ PHASE 3: WORD-TRIM FALLBACK ============
   if (best.servers.length < 3) {
     const p3 = await phase3WordTrim(
       titleEnglish, titleRomaji, season, episode, isMovieRequest, addedSlugs
@@ -770,8 +768,9 @@ async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
 
   return [];
 }
+
 // ===================================================================
-// PROXY HANDLER — v11.1 with HTML URL rewrite
+// PROXY HANDLER — Simple passthrough (no HTML rewrite)
 // ===================================================================
 async function handleProxy(url) {
   const targetUrl = url.searchParams.get("url");
@@ -781,13 +780,14 @@ async function handleProxy(url) {
 
   try {
     const targetURL = new URL(targetUrl);
-    const targetOrigin = targetURL.origin;
-
     const headers = new Headers();
     headers.set("User-Agent", USER_AGENT);
-    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    headers.set(
+      "Accept",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    );
     headers.set("Accept-Language", "en-US,en;q=0.9");
-    headers.set("Referer", targetOrigin + "/");
+    headers.set("Referer", targetURL.origin + "/");
 
     const response = await fetch(targetUrl, { headers, redirect: "follow" });
 
@@ -795,41 +795,8 @@ async function handleProxy(url) {
     newHeaders.delete("X-Frame-Options");
     newHeaders.delete("Content-Security-Policy");
     newHeaders.delete("Content-Security-Policy-Report-Only");
-    newHeaders.delete("Content-Encoding");
-    newHeaders.delete("Content-Length");
     newHeaders.set("Access-Control-Allow-Origin", "*");
 
-    const contentType = (response.headers.get("content-type") || "").toLowerCase();
-
-    // If HTML → rewrite relative URLs to absolute
-    if (contentType.includes("text/html")) {
-      let html = await response.text();
-
-      // Rewrite src="/..." / href="/..." / action="/..." → absolute to target origin
-      html = html.replace(
-        /(\s(?:src|href|action|data-src|poster)=["'])\/(?!\/)([^"']*)(["'])/gi,
-        (m, p1, p2, p3) => `${p1}${targetOrigin}/${p2}${p3}`
-      );
-
-      // Rewrite src="//..." → https://...
-      html = html.replace(
-        /(\s(?:src|href|action|data-src|poster)=["'])\/\/([^"']*)(["'])/gi,
-        (m, p1, p2, p3) => `${p1}https://${p2}${p3}`
-      );
-
-      // Rewrite CSS url(/...) inside <style> tags
-      html = html.replace(
-        /url\((['"]?)\/(?!\/)([^'")]*)\1\)/gi,
-        (m, q, p) => `url('${targetOrigin}/${p}')`
-      );
-
-      return new Response(html, {
-        status: response.status,
-        headers: newHeaders,
-      });
-    }
-
-    // Non-HTML — stream as-is (video segments, JS, CSS, etc.)
     return new Response(response.body, {
       status: response.status,
       headers: newHeaders,
@@ -875,7 +842,7 @@ async function handleDebug(url) {
 
   return jsonResponse({
     success: true,
-    version: "11.1-industrial",
+    version: "12.0-industrial",
     input: { slug, titleRomaji, titleEnglish, anilistId },
     anilist_meta: meta,
     root_series_info: rootInfo,

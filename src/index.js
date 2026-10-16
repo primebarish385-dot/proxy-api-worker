@@ -1,16 +1,18 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v8.1 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v9.0 - FINAL)
 // ===================================================================
-// v8.1 FINAL FIX:
-//   • Phase 1 candidates limited to 5 (prevents scraper rate-limit)
-//   • Dub variants only in search queries (not direct slugs)
-//   • Best-tracking (not first-found) in all phases
-//   • Clean 6-layer fallback chain
+// v9.0 Features:
+//   • Uses Deno AniList proxy (no direct AniList call)
+//   • Fetches format + year via proxy
+//   • Only TV & MOVIE formats get year suffix
+//   • Year suffix added to slug candidates
+//   • All previous v8.1 fixes retained
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
 const TOONSTREAM_API = "https://toonstream-scraper-5mws.onrender.com";
 const TOONSTREAM_SITE = "https://toonstream.us";
+const ANILIST_PROXY_URL = "https://gojotv-anilist-proxy.taiwansixtynine0987-arch.deno.net/graphql";
 
 const WORKING_TOONSTREAM_SERVERS = [
   "voe.sx",
@@ -75,8 +77,8 @@ export default {
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v8.1",
-      version: "8.1-industrial",
+      message: "Proxy API Worker v9.0",
+      version: "9.0-industrial",
       sources: ["anikoto", "toonstream"],
       working_servers: WORKING_TOONSTREAM_SERVERS.length,
       min_match_score: MIN_MATCH_SCORE,
@@ -238,34 +240,90 @@ function toSlug(s) {
 }
 
 // ===================================================================
-// SLUG CANDIDATES — v8.1 (LIMITED to 5 — no dub variants here)
+// ANILIST PROXY CALL — fetch format + year
 // ===================================================================
-function getSlugCandidates(slug, ...titles) {
-  const candidates = new Set();
+async function fetchAniListMeta(anilistId) {
+  if (!anilistId || parseInt(anilistId) <= 0) return null;
+  try {
+    const gqlQuery = {
+      query: `query($id: Int) { Media(id: $id) { format startDate { year } seasonYear } }`,
+      variables: { id: parseInt(anilistId) },
+    };
+    const res = await fetch(ANILIST_PROXY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify(gqlQuery),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const media = json?.data?.Media;
+    if (!media) return null;
 
-  // TITLE-BASED SLUGS FIRST (ToonStream uses display titles)
+    const format = (media.format || "").toUpperCase();
+    if (format !== "TV" && format !== "MOVIE") return null;
+
+    const year = media.startDate?.year || media.seasonYear || null;
+    return { format, year };
+  } catch (e) {
+    return null;
+  }
+}
+
+// ===================================================================
+// SLUG CANDIDATES — with year variants (TV/MOVIE only)
+// ===================================================================
+function getSlugCandidates(slug, ...args) {
+  const candidates = new Set();
+  const year = args.pop();
+  const titles = args;
+
+  const addYearVariants = (baseSlug) => {
+    if (!baseSlug || !year) return;
+    candidates.add(`${baseSlug}-${year}`);
+  };
+
   for (const title of titles) {
     if (!title) continue;
     const aliasTitle = applyAlias(title);
     const normTitle = normalizeTitle(aliasTitle);
     const cleanTitle = removeStopWords(normTitle);
 
-    if (title) candidates.add(toSlug(title));
-    if (normTitle) candidates.add(toSlug(normTitle));
-    if (cleanTitle) candidates.add(toSlug(cleanTitle));
+    if (title) {
+      const s = toSlug(title);
+      candidates.add(s);
+      addYearVariants(s);
+    }
+    if (normTitle) {
+      const s = toSlug(normTitle);
+      candidates.add(s);
+      addYearVariants(s);
+    }
+    if (cleanTitle) {
+      const s = toSlug(cleanTitle);
+      candidates.add(s);
+      addYearVariants(s);
+    }
   }
 
-  // DB slug AFTER titles
-  if (slug) candidates.add(slug);
+  if (slug) {
+    candidates.add(slug);
+    addYearVariants(slug);
+  }
   const normSlug = normalizeSlug(slug);
-  if (normSlug && normSlug !== slug) candidates.add(normSlug);
+  if (normSlug && normSlug !== slug) {
+    candidates.add(normSlug);
+    addYearVariants(normSlug);
+  }
 
-  // ⚡ Limit to top 5 candidates — prevents scraper rate-limit
   return Array.from(candidates).filter((c) => c.length > 0).slice(0, MAX_PHASE1_CANDIDATES);
 }
 
 // ===================================================================
-// SEARCH QUERIES — includes dub variants for Phase 2
+// SEARCH QUERIES — with dub variants
 // ===================================================================
 function getSearchQueriesForTitle(title) {
   const queries = new Set();
@@ -283,7 +341,7 @@ function getSearchQueriesForTitle(title) {
   if (words.length >= 5) queries.add(words.slice(0, 4).join(" "));
   if (words.length >= 4) queries.add(words.slice(0, 3).join(" "));
 
-  // ⚡ Dub variant queries — these find "hindi dub" entries
+  // Dub variant queries
   const dubSuffixes = ["Hindi Dub", "Muse Dub", "Sony Yay Dub", "Dub"];
   const baseTitles = [normTitle, cleanTitle, aliasTitle].filter(
     (t, i, arr) => t && t.length >= 3 && arr.indexOf(t) === i
@@ -306,7 +364,7 @@ function getAllSearchQueries(...titles) {
   return Array.from(all);
 }
 // ===================================================================
-// ANIKOTO — Multi-Result Fallback with BOTH titles
+// ANIKOTO — Multi-Result Fallback
 // ===================================================================
 async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
   const titlesToTry = [titleRomaji, titleEnglish].filter(
@@ -425,7 +483,6 @@ async function searchToonStreamSlugs(title) {
       const score2 = similarityScore(titleClean, itemTitleClean);
       let score = Math.max(score1, score2);
 
-      // Boost dub / multi-audio variant entries
       if (itemTitleLower.includes("hindi dub")) score += 25;
       else if (itemTitleLower.includes("hindi")) score += 20;
       else if (itemTitleLower.includes("muse dub")) score += 22;
@@ -503,11 +560,11 @@ function buildToonStreamServers(rawServers) {
 }
 
 // ===================================================================
-// TOONSTREAM MAIN — Best-tracking 4-phase fallback
+// TOONSTREAM MAIN — Best-tracking 4-phase fallback (with year)
 // ===================================================================
-async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish) {
-  // ============ Phase 1: Direct slug attempts (parallel, LIMITED to 5) ============
-  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
+async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish, year) {
+  // ============ Phase 1: Direct slug attempts (with year variants) ============
+  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish, year);
   const phase1 = await Promise.all(
     slugCandidates.map(async (candidate) => {
       const raw = await fetchToonStreamServers(candidate, season, episode);
@@ -515,13 +572,11 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     })
   );
 
-  // Track BEST result (not first-found)
   let best = { slug: null, servers: [] };
   for (const r of phase1) {
     if (r.servers.length > best.servers.length) best = r;
   }
 
-  // Early exit ONLY if already good enough (>= 5 servers)
   if (best.servers.length >= 5) return best.servers;
 
   // ============ Phase 2: Search with BOTH titles + dub variants ============
@@ -553,7 +608,7 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
     if (best.servers.length >= 7) break;
   }
 
-  // ============ Phase 4: Progressive word-trim (only if best still weak) ============
+  // ============ Phase 4: Progressive word-trim (if best still weak) ============
   if (best.servers.length < 4) {
     const longestTitle =
       titleEnglish && titleEnglish.length > (titleRomaji || "").length
@@ -593,14 +648,22 @@ async function handleDebug(url) {
   const slug = params.get("slug") || "";
   const titleRomaji = params.get("title_romaji") || "";
   const titleEnglish = params.get("title_english") || "";
+  const anilistId = params.get("anilist_id") || "";
 
-  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish);
+  let meta = null;
+  if (anilistId) {
+    meta = await fetchAniListMeta(anilistId);
+  }
+
+  const year = meta?.year || null;
+  const slugCandidates = getSlugCandidates(slug, titleRomaji, titleEnglish, year);
   const searchQueries = getAllSearchQueries(titleRomaji, titleEnglish);
 
   return jsonResponse({
     success: true,
-    version: "8.1-industrial",
-    input: { slug, titleRomaji, titleEnglish },
+    version: "9.0-industrial",
+    input: { slug, titleRomaji, titleEnglish, anilistId },
+    anilist_meta: meta,
     phase1_candidates: slugCandidates,
     phase2_search_queries: searchQueries,
   });
@@ -699,6 +762,17 @@ async function handleStreamingAPI(url) {
   const toonTitleEnglish =
     titleEnglish || titleRomaji || slug.replace(/-/g, " ");
 
+  // Fetch AniList meta (year) via proxy — only if anilistId present
+  let releaseYear = null;
+  let anilistFormat = null;
+  if (anilistId && parseInt(anilistId) > 0) {
+    const meta = await fetchAniListMeta(anilistId);
+    if (meta) {
+      releaseYear = meta.year;
+      anilistFormat = meta.format;
+    }
+  }
+
   const [anikotoServers, toonstreamServers] = await Promise.all([
     getAnikotoLinks(anikotoTitleRomaji, anikotoTitleEnglish, episode),
     slug
@@ -707,7 +781,8 @@ async function handleStreamingAPI(url) {
           season,
           episode,
           toonTitleRomaji,
-          toonTitleEnglish
+          toonTitleEnglish,
+          releaseYear
         )
       : Promise.resolve([]),
   ]);
@@ -729,6 +804,8 @@ async function handleStreamingAPI(url) {
       title_romaji: titleRomaji,
       season: season,
       episode: episode,
+      anilist_format: anilistFormat,
+      release_year: releaseYear,
       total_servers: allServers.length,
       sub_count: subServers.length,
       dub_count: dubServers.length,

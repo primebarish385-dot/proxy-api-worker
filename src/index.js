@@ -1,13 +1,9 @@
 // ===================================================================
-// src/index.js - Proxy API Worker (Industrial Level v11.0 - FINAL)
+// src/index.js - Proxy API Worker (Industrial Level v11.1 - FINAL)
 // ===================================================================
-// v11.0 ARC-AWARE ARCHITECTURE:
-//   • AniList relations walk → root series + seasonsBefore
-//   • Dual season try: user_season AND absoluteSeason
-//   • In-memory AniList cache (5-min, warm worker)
-//   • Rate-safe batching (batch=2)
-//   • Search-first + guess-fallback + word-trim
-//   • All v10.0 features retained
+// v11.1 FIX:
+//   • handleProxy: HTML URL rewrite (relative → absolute)
+//   • All v11.0 features retained (arc-aware, search-first)
 // ===================================================================
 
 const ANIKOTO_API = "https://anikoto-api-bl5m.onrender.com";
@@ -35,9 +31,8 @@ const PARALLEL_BATCH_SIZE = 2;
 const SCRAPER_FETCH_TIMEOUT_MS = 20000;
 const FETCH_TIMEOUT_MS = 15000;
 const MAX_PREQUEL_DEPTH = 4;
-const ANILIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const ANILIST_CACHE_TTL_MS = 5 * 60 * 1000;
 
-// ⚡ In-memory AniList cache (lives across requests in warm workers)
 const ANILIST_CACHE = new Map();
 
 const STOP_WORDS = new Set([
@@ -79,15 +74,10 @@ export default {
 
     return jsonResponse({
       success: true,
-      message: "Proxy API Worker v11.0",
-      version: "11.0-industrial",
+      message: "Proxy API Worker v11.1",
+      version: "11.1-industrial",
       architecture: "arc-aware-search-first",
-      debug_endpoints: [
-        "/api/debug",
-        "/api/slug-test",
-        "/api/search-test",
-        "/api/root-test",
-      ],
+      debug_endpoints: ["/api/debug", "/api/slug-test", "/api/search-test", "/api/root-test"],
     });
   },
 };
@@ -247,7 +237,6 @@ async function fetchAniListMedia(anilistId) {
   if (!anilistId || parseInt(anilistId) <= 0) return null;
   const idNum = parseInt(anilistId);
 
-  // Cache check
   const cached = ANILIST_CACHE.get(idNum);
   if (cached && Date.now() - cached.ts < ANILIST_CACHE_TTL_MS) {
     return cached.data;
@@ -290,7 +279,6 @@ async function fetchAniListMedia(anilistId) {
     const json = await res.json();
     const media = json?.data?.Media || null;
 
-    // Save to cache
     ANILIST_CACHE.set(idNum, { data: media, ts: Date.now() });
     return media;
   } catch (e) {
@@ -299,7 +287,7 @@ async function fetchAniListMedia(anilistId) {
 }
 
 // ===================================================================
-// ROOT SERIES DETECTION — walk PREQUEL chain (TV format only)
+// ROOT SERIES DETECTION — walk PREQUEL chain (TV only)
 // ===================================================================
 async function findRootSeriesInfo(anilistId, depth = 0, visited = new Set()) {
   if (depth > MAX_PREQUEL_DEPTH) return null;
@@ -320,11 +308,10 @@ async function findRootSeriesInfo(anilistId, depth = 0, visited = new Set()) {
     .sort((a, b) => {
       const ya = a.node.startDate?.year || 9999;
       const yb = b.node.startDate?.year || 9999;
-      return yb - ya; // Most recent first
+      return yb - ya;
     });
 
   if (tvPrequels.length === 0) {
-    // We are the root
     return {
       rootId: media.id,
       rootTitleRomaji: media.title?.romaji || "",
@@ -347,7 +334,6 @@ async function findRootSeriesInfo(anilistId, depth = 0, visited = new Set()) {
     seasonsBefore: parentInfo.seasonsBefore + 1,
   };
 }
-
 // ===================================================================
 // TOONSTREAM SEARCH — returns { slug, title, type, year }
 // ===================================================================
@@ -382,6 +368,7 @@ async function searchToonStreamResults(title) {
     return [];
   }
 }
+
 // ===================================================================
 // TOONSTREAM HELPERS
 // ===================================================================
@@ -529,7 +516,7 @@ async function phase1SearchFirst(titleEnglish, titleRomaji, slug, season, episod
 }
 
 // ===================================================================
-// PHASE 1b — ARC-AWARE (only if Phase 1 weak)
+// PHASE 1b — ARC-AWARE (only if Phase 1 weak AND arc detected)
 // ===================================================================
 async function phase1bArcAware(rootInfo, userSeason, episode, isMovieRequest, year, addedSlugs) {
   if (!rootInfo || (!rootInfo.rootTitleEnglish && !rootInfo.rootTitleRomaji)) {
@@ -671,7 +658,7 @@ async function phase3WordTrim(titleEnglish, titleRomaji, season, episode, isMovi
 }
 
 // ===================================================================
-// TOONSTREAM MAIN — Arc-Aware Search-First (v11.0)
+// TOONSTREAM MAIN — Arc-Aware Search-First (v11.1)
 // ===================================================================
 async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEnglish, anilistMeta, rootInfo) {
   const isMovieRequest = anilistMeta?.format === "MOVIE";
@@ -686,11 +673,10 @@ async function getToonStreamLinks(slug, season, episode, titleRomaji, titleEngli
   let best = p1.best;
   const addedSlugs = p1.addedSlugs;
 
-  // ✅ Early exit if we already have enough (v10.0's success case)
   if (best.servers.length >= 5) return best.servers;
 
   // ============================================================
-  // PHASE 1b: ARC-AWARE (only if Phase 1 weak AND arc detected)
+  // PHASE 1b: ARC-AWARE (only if arc detected)
   // ============================================================
   if (best.servers.length < 5 && rootInfo && (rootInfo.seasonsBefore || 0) > 0) {
     const p1b = await phase1bArcAware(
@@ -784,6 +770,74 @@ async function getAnikotoLinks(titleRomaji, titleEnglish, episode) {
 
   return [];
 }
+// ===================================================================
+// PROXY HANDLER — v11.1 with HTML URL rewrite
+// ===================================================================
+async function handleProxy(url) {
+  const targetUrl = url.searchParams.get("url");
+  if (!targetUrl) {
+    return jsonResponse({ success: false, error: "Missing 'url' parameter" }, 400);
+  }
+
+  try {
+    const targetURL = new URL(targetUrl);
+    const targetOrigin = targetURL.origin;
+
+    const headers = new Headers();
+    headers.set("User-Agent", USER_AGENT);
+    headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    headers.set("Accept-Language", "en-US,en;q=0.9");
+    headers.set("Referer", targetOrigin + "/");
+
+    const response = await fetch(targetUrl, { headers, redirect: "follow" });
+
+    const newHeaders = new Headers(response.headers);
+    newHeaders.delete("X-Frame-Options");
+    newHeaders.delete("Content-Security-Policy");
+    newHeaders.delete("Content-Security-Policy-Report-Only");
+    newHeaders.delete("Content-Encoding");
+    newHeaders.delete("Content-Length");
+    newHeaders.set("Access-Control-Allow-Origin", "*");
+
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+
+    // If HTML → rewrite relative URLs to absolute
+    if (contentType.includes("text/html")) {
+      let html = await response.text();
+
+      // Rewrite src="/..." / href="/..." / action="/..." → absolute to target origin
+      html = html.replace(
+        /(\s(?:src|href|action|data-src|poster)=["'])\/(?!\/)([^"']*)(["'])/gi,
+        (m, p1, p2, p3) => `${p1}${targetOrigin}/${p2}${p3}`
+      );
+
+      // Rewrite src="//..." → https://...
+      html = html.replace(
+        /(\s(?:src|href|action|data-src|poster)=["'])\/\/([^"']*)(["'])/gi,
+        (m, p1, p2, p3) => `${p1}https://${p2}${p3}`
+      );
+
+      // Rewrite CSS url(/...) inside <style> tags
+      html = html.replace(
+        /url\((['"]?)\/(?!\/)([^'")]*)\1\)/gi,
+        (m, q, p) => `url('${targetOrigin}/${p}')`
+      );
+
+      return new Response(html, {
+        status: response.status,
+        headers: newHeaders,
+      });
+    }
+
+    // Non-HTML — stream as-is (video segments, JS, CSS, etc.)
+    return new Response(response.body, {
+      status: response.status,
+      headers: newHeaders,
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, error: e.message }, 500);
+  }
+}
 
 // ===================================================================
 // DEBUG ENDPOINTS
@@ -821,7 +875,7 @@ async function handleDebug(url) {
 
   return jsonResponse({
     success: true,
-    version: "11.0-industrial",
+    version: "11.1-industrial",
     input: { slug, titleRomaji, titleEnglish, anilistId },
     anilist_meta: meta,
     root_series_info: rootInfo,
@@ -866,41 +920,6 @@ async function handleRootTest(url) {
   const rootInfo = await findRootSeriesInfo(anilistId);
   return jsonResponse({ success: true, anilist_id: anilistId, root_series_info: rootInfo });
 }
-// ===================================================================
-// PROXY HANDLER
-// ===================================================================
-async function handleProxy(url) {
-  const targetUrl = url.searchParams.get("url");
-  if (!targetUrl) {
-    return jsonResponse({ success: false, error: "Missing 'url' parameter" }, 400);
-  }
-
-  try {
-    const targetURL = new URL(targetUrl);
-    const headers = new Headers();
-    headers.set("User-Agent", USER_AGENT);
-    headers.set(
-      "Accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    );
-    headers.set("Accept-Language", "en-US,en;q=0.9");
-    headers.set("Referer", targetURL.origin + "/");
-
-    const response = await fetch(targetUrl, { headers, redirect: "follow" });
-    const newHeaders = new Headers(response.headers);
-    newHeaders.delete("X-Frame-Options");
-    newHeaders.delete("Content-Security-Policy");
-    newHeaders.delete("Content-Security-Policy-Report-Only");
-    newHeaders.set("Access-Control-Allow-Origin", "*");
-
-    return new Response(response.body, {
-      status: response.status,
-      headers: newHeaders,
-    });
-  } catch (e) {
-    return jsonResponse({ success: false, error: e.message }, 500);
-  }
-}
 
 // ===================================================================
 // MAIN STREAMING API HANDLER
@@ -938,7 +957,6 @@ async function handleStreamingAPI(url) {
           format,
           year: media.startDate?.year || media.seasonYear || null,
         };
-        // Only walk prequels for TV
         if (format === "TV") {
           rootInfo = await findRootSeriesInfo(anilistId);
         }
